@@ -35,7 +35,7 @@ def split_images_in_folder(input_folder, output_left_folder, output_right_folder
 
 # Usage example
 split_images_in_folder(
-    input_folder="not full",
+    input_folder="full",
     output_left_folder="output_left_folder",
     output_right_folder="output_right_folder"
 )
