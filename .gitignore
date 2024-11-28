@@ -161,3 +161,9 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 before_after_256.npz
+/original/
+/models/
+/original.zip
+/after_mask_0_4.zip
+/after/
+/datasets/
