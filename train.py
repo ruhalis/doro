@@ -1,6 +1,8 @@
+import os
 import torch
 import torch.nn as nn
 import torch.distributed as dist
+import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.data import DataLoader
@@ -17,10 +19,13 @@ import pandas as pd
 import time
 from models.vgg_perceptual_loss import VGGPerceptualLoss
 import torch.nn.functional as F
-from torchmetrics.image import FrechetInceptionDistance
+from torchmetrics.image.inception import InceptionScore
+from torchmetrics.image.fid import FrechetInceptionDistance
 from facenet_pytorch import InceptionResnetV1, MTCNN
 from sklearn.metrics import mean_squared_error
 import lpips
+from torch.cuda.amp import GradScaler
+import datetime
 
 class AttGANTrainer:
     def __init__(self, config, gpu_id):
@@ -67,7 +72,7 @@ class AttGANTrainer:
             )
         
         # Setup automatic mixed precision
-        self.scaler = torch.amp.GradScaler(device='cuda', enabled=config['use_amp'])
+        self.scaler = GradScaler(enabled=config['use_amp'])
         
         # Setup losses
         self.adversarial_loss = nn.BCEWithLogitsLoss()
@@ -86,8 +91,13 @@ class AttGANTrainer:
         # Add identity loss
         self.identity_loss = nn.L1Loss()
         
-        # Initialize FID metric
-        self.fid = FrechetInceptionDistance(normalize=True).to(self.device)
+        # Initialize FID metric only if torch-fidelity is available
+        try:
+            self.fid = FrechetInceptionDistance(normalize=True).to(self.device)
+            self.use_fid = True
+        except ModuleNotFoundError:
+            print("Warning: torch-fidelity not installed. FID calculation will be disabled.")
+            self.use_fid = False
         
         # Initialize LPIPS for perceptual similarity
         self.lpips_fn = lpips.LPIPS(net='alex').to(self.device)
@@ -106,12 +116,25 @@ class AttGANTrainer:
     def setup_dataloaders(self):
         transform = transforms.Compose([
             transforms.Resize((self.config['image_size'], self.config['image_size']), 
-                            interpolation=transforms.InterpolationMode.BILINEAR),  # Use BILINEAR instead of BICUBIC
+                            interpolation=transforms.InterpolationMode.BILINEAR),
             transforms.ToTensor(),
             transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
         ])
         
-        # Create datasets without caching
+        # Add dataset validation
+        if self.gpu_id == 0:  # Only print on main process
+            print(f"\nValidating dataset at {self.config['dataset_path']}")
+            for split in ['train', 'val']:
+                for domain in ['A', 'B']:
+                    path = os.path.join(self.config['dataset_path'], f'{split}_{domain}')
+                    if not os.path.exists(path):
+                        raise RuntimeError(f"Dataset directory not found: {path}")
+                    files = os.listdir(path)
+                    print(f"Found {len(files)} images in {split}_{domain}")
+                    if len(files) == 0:
+                        raise RuntimeError(f"No images found in {path}")
+        
+        # Create datasets
         train_dataset = CustomDataset(
             root_dir=self.config['dataset_path'],
             phase='train',
@@ -124,31 +147,55 @@ class AttGANTrainer:
             transform=transform
         )
         
-        # Create distributed samplers
-        train_sampler = DistributedSampler(train_dataset)
-        val_sampler = DistributedSampler(val_dataset, shuffle=False)
+        # Print dataset sizes
+        if self.gpu_id == 0:
+            print(f"\nDataset sizes:")
+            print(f"Training: {len(train_dataset)} pairs")
+            print(f"Validation: {len(val_dataset)} pairs")
         
-        # Create dataloaders with memory-optimized settings
-        self.train_loader = DataLoader(
+        # Create samplers for distributed training
+        train_sampler = DistributedSampler(
             train_dataset,
-            batch_size=self.config['batch_size'],
-            sampler=train_sampler,
-            num_workers=self.config['num_workers'],
-            pin_memory=self.config['pin_memory'],
-            prefetch_factor=self.config['prefetch_factor'],
-            persistent_workers=True
+            num_replicas=dist.get_world_size(),
+            rank=self.gpu_id
         )
         
-        # Add this to set up the validation loader
-        self.val_loader = DataLoader(
+        val_sampler = DistributedSampler(
             val_dataset,
-            batch_size=self.config['batch_size'],
-            sampler=val_sampler,
-            num_workers=self.config['num_workers'],
-            pin_memory=self.config['pin_memory'],
-            prefetch_factor=self.config['prefetch_factor'],
-            persistent_workers=True
+            num_replicas=dist.get_world_size(),
+            rank=self.gpu_id
         )
+        
+        # Create data loaders with error handling
+        try:
+            self.train_loader = DataLoader(
+                train_dataset,
+                batch_size=self.config['batch_size'],
+                sampler=train_sampler,
+                num_workers=self.config['num_workers'],
+                pin_memory=self.config['pin_memory'],
+                prefetch_factor=self.config['prefetch_factor'],
+                drop_last=True
+            )
+            
+            self.val_loader = DataLoader(
+                val_dataset,
+                batch_size=self.config['batch_size'],
+                sampler=val_sampler,
+                num_workers=self.config['num_workers'],
+                pin_memory=self.config['pin_memory'],
+                prefetch_factor=self.config['prefetch_factor']
+            )
+            
+            # Verify we can load at least one batch
+            if self.gpu_id == 0:
+                print("\nVerifying data loading...")
+                train_iter = iter(self.train_loader)
+                first_batch = next(train_iter)
+                print(f"Successfully loaded first batch of size: {first_batch[0].shape}")
+            
+        except Exception as e:
+            raise RuntimeError(f"Failed to create data loaders on GPU {self.gpu_id}: {str(e)}")
 
     def train(self):
         for epoch in range(self.config['epochs']):
@@ -213,19 +260,22 @@ class AttGANTrainer:
                 self.log_progress(epoch, batch_idx, g_loss, d_loss)
 
     def log_progress(self, epoch, batch_idx, g_loss, d_loss):
-        # Log to tensorboard
-        step = epoch * len(self.train_loader) + batch_idx
-        self.writer.add_scalar('Train/G_loss', g_loss.item(), step)
-        self.writer.add_scalar('Train/D_loss', d_loss.item(), step)
+        """Log training progress"""
+        # Only log to tensorboard from the main process
+        if self.gpu_id == 0 and hasattr(self, 'writer'):
+            # Log to tensorboard
+            step = epoch * len(self.train_loader) + batch_idx
+            self.writer.add_scalar('Train/G_loss', g_loss.item(), step)
+            self.writer.add_scalar('Train/D_loss', d_loss.item(), step)
+            
+            # Log learning rates
+            self.writer.add_scalar('LR/Generator', 
+                                self.g_optimizer.param_groups[0]['lr'], step)
+            self.writer.add_scalar('LR/Discriminator', 
+                                self.d_optimizer.param_groups[0]['lr'], step)
         
-        # Log learning rates
-        self.writer.add_scalar('LR/Generator', 
-                              self.g_optimizer.param_groups[0]['lr'], step)
-        self.writer.add_scalar('LR/Discriminator', 
-                              self.d_optimizer.param_groups[0]['lr'], step)
-        
-        # Print progress
-        print(f"[Epoch {epoch}/{self.config['epochs']}] "
+        # Print progress (from all processes)
+        print(f"[GPU {self.gpu_id}] [Epoch {epoch}/{self.config['epochs']}] "
               f"[Batch {batch_idx}/{len(self.train_loader)}] "
               f"[D loss: {d_loss.item():.4f}] "
               f"[G loss: {g_loss.item():.4f}]")
@@ -331,6 +381,9 @@ class AttGANTrainer:
 
     def compute_fid_score(self, real_images, fake_images):
         """Compute FID score between real and generated images"""
+        if not self.use_fid:
+            return 0.0  # Return dummy value if FID calculation is disabled
+        
         self.fid.update(real_images, real=True)
         self.fid.update(fake_images, real=False)
         fid_score = self.fid.compute()
@@ -368,23 +421,75 @@ class AttGANTrainer:
         if torch.cuda.is_available():
             return torch.cuda.memory_allocated() / 1024**2, torch.cuda.memory_reserved() / 1024**2
 
+    def train_discriminator(self, real_B, fake_B):
+        """Train discriminator"""
+        batch_size = real_B.size(0)
+        
+        # Real images
+        real_validity = self.D(real_B)
+        real_labels = torch.ones_like(real_validity).to(self.device)
+        d_real_loss = self.adversarial_loss(real_validity, real_labels)
+        
+        # Fake images
+        fake_validity = self.D(fake_B.detach())
+        fake_labels = torch.zeros_like(fake_validity).to(self.device)
+        d_fake_loss = self.adversarial_loss(fake_validity, fake_labels)
+        
+        # Total discriminator loss
+        d_loss = (d_real_loss + d_fake_loss) / 2
+        
+        return d_loss
+
+    def train_generator(self, real_A, real_B, fake_B):
+        """Train generator"""
+        # Adversarial loss
+        fake_validity = self.D(fake_B)
+        real_labels = torch.ones_like(fake_validity).to(self.device)
+        g_adv_loss = self.adversarial_loss(fake_validity, real_labels)
+        
+        # Reconstruction loss
+        g_rec_loss = self.reconstruction_loss(fake_B, real_B)
+        
+        # Perceptual loss
+        g_perceptual_loss = self.perceptual_loss(fake_B, real_B)
+        
+        # Identity loss
+        g_identity_loss = self.identity_loss(fake_B, real_B)
+        
+        # Total generator loss
+        g_loss = (
+            self.config['lambda_adv'] * g_adv_loss +
+            self.config['lambda_rec'] * g_rec_loss +
+            self.config['lambda_perceptual'] * g_perceptual_loss +
+            self.config['lambda_identity'] * g_identity_loss
+        )
+        
+        return g_loss
+
 def setup(rank, world_size, config):
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '12355'
     
-    # Initialize process group
+    # Initialize process group with timeout
     dist.init_process_group(
-        backend=config['dist_backend'],
-        init_method=config['dist_url'],
+        backend='nccl',  # Use NCCL backend directly
+        init_method='tcp://127.0.0.1:12355',  # Use explicit IP instead of localhost
         world_size=world_size,
-        rank=rank
+        rank=rank,
+        timeout=datetime.timedelta(minutes=30)  # Add timeout
     )
+    
+    # Set device for this process
+    torch.cuda.set_device(rank)
 
 def cleanup():
     dist.destroy_process_group()
 
 def main(rank, world_size, config):
     try:
+        # Set up error handling for CUDA devices
+        torch.cuda.set_device(rank)
+        
         setup(rank, world_size, config)
         
         # Create trainer instance
@@ -398,9 +503,11 @@ def main(rank, world_size, config):
         raise e
     
     finally:
-        cleanup()
+        if dist.is_initialized():
+            cleanup()
 
 if __name__ == "__main__":
+    print("Starting training script...")
     # Configuration
     config = {
         'dataset_path': 'datasets/dataset',
@@ -409,39 +516,40 @@ if __name__ == "__main__":
         'log_dir': 'logs',
         
         # Training parameters
-        'batch_size': 2,  # Reduced from 4 due to memory constraints
-        'num_workers': 2,
-        'lr': 0.00005,  # Reduced learning rate for stability
+        'batch_size': 8,          # Increased from 1, but still reasonable for 512x512
+        'num_workers': 4,         # 2 * num_gpus is a good rule of thumb
+        'lr': 0.00002 * (8/1),   # Scale learning rate with batch size
         'beta1': 0.5,
         'beta2': 0.999,
-        'epochs': 200,
+        'epochs': 200,           # Can reduce epochs with larger batch size
         
-        # Model parameters
-        'image_size': 1024,  # Increased from 256
-        'lambda_adv': 0.5,   # Reduced adversarial weight
-        'lambda_rec': 15.0,  # Increased reconstruction weight
-        'lambda_perceptual': 7.0,  # Increased perceptual weight
-        'lambda_identity': 3.0,    # Increased identity weight
+        # Model parameters - Tuned for augmented pairs
+        'image_size': 512,       # Keep 512 for detail preservation
+        'lambda_adv': 0.03,      # Reduced further due to augmented variations
+        'lambda_rec': 45.0,      # Increased to maintain consistency across augmentations
+        'lambda_perceptual': 25.0,  # Increased to maintain perceptual consistency
+        'lambda_identity': 20.0,    # Increased to ensure identity preservation across augmentations
         
         # Memory optimization
-        'use_amp': True,  # Important for 1024x1024
-        'gradient_accumulation_steps': 4,  # New parameter
-        'batch_chunk_size': 256,   # New parameter for progressive processing
+        'use_amp': True,         # Use automatic mixed precision
+        'gradient_accumulation_steps': 1,  # Reduced since we increased batch size
+        'batch_chunk_size': 64,   # Reduced to handle augmented data better
         
         # Training schedule
-        'val_frequency': 2,  # More frequent validation
-        'save_frequency': 5,
-        'log_frequency': 25,
+        'val_frequency': 1,      # Keep frequent validation
+        'save_frequency': 3,     # More frequent saving due to augmented data
+        'log_frequency': 5,      # More frequent logging to track augmented variations
         
         # Distributed training
-        'dist_url': 'tcp://localhost:12355',
+        'dist_url': 'tcp://127.0.0.1:12355',
         'dist_backend': 'nccl',
         'multiprocessing_distributed': True,
-        'pin_memory': False,  # Added
-        'prefetch_factor': 2,  # Added
-        'use_lr_scheduler': True,  # Added
-        'lr_scheduler_patience': 10,  # Added
-        'lr_scheduler_factor': 0.5,  # Added
+        'pin_memory': True,       # Enable pin memory for faster data transfer
+        'prefetch_factor': 2,     # Reduced prefetch factor
+        'use_lr_scheduler': True,
+        'lr_scheduler_patience': 10,
+        'lr_scheduler_factor': 0.5,
+        
     }
 
     # Create necessary directories
@@ -449,14 +557,23 @@ if __name__ == "__main__":
     os.makedirs(config['sample_dir'], exist_ok=True)
     os.makedirs(config['log_dir'], exist_ok=True)
 
-    # Number of GPUs
-    world_size = 2
+    # Check CUDA availability
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is not available")
+    
+    # Get number of available GPUs
+    world_size = torch.cuda.device_count()
     
     # Launch training processes
-    import torch.multiprocessing as mp
-    mp.spawn(
-        main,
-        args=(world_size, config),
-        nprocs=world_size,
-        join=True
-    )
+    try:
+        mp.spawn(
+            main,
+            args=(world_size, config),
+            nprocs=world_size,
+            join=True
+        )
+    except Exception as e:
+        print(f"Training failed with error: {str(e)}")
+        # Cleanup in case of error
+        if dist.is_initialized():
+            cleanup()
