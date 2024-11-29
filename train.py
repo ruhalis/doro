@@ -329,12 +329,12 @@ class AttGANTrainer:
         
         for batch_idx, (real_A, real_B) in enumerate(tqdm(self.train_loader)):
             try:
-                # Process images in chunks if needed
-                real_A = self.process_large_image(real_A.to(self.device))
-                real_B = self.process_large_image(real_B.to(self.device))
+                # Move data to device
+                real_A = real_A.to(self.device)
+                real_B = real_B.to(self.device)
                 
                 # Zero gradients
-                self.d_optimizer.zero_grad(set_to_none=True)  # More efficient than zero_grad()
+                self.d_optimizer.zero_grad(set_to_none=True)
                 self.g_optimizer.zero_grad(set_to_none=True)
                 
                 # Accumulate gradients
@@ -343,10 +343,10 @@ class AttGANTrainer:
                 
                 for acc_step in range(self.config['gradient_accumulation_steps']):
                     with torch.cuda.amp.autocast(enabled=self.config['use_amp']):
-                        # Generate fake images in chunks if needed
-                        fake_B = self.process_large_image(self.G(real_A))
+                        # Generate fake images
+                        fake_B = self.G(real_A)
                         
-                        # Train Discriminator
+                        # Train Discriminator first
                         d_loss = self.train_discriminator(real_B, fake_B.detach())
                         d_loss = d_loss / self.config['gradient_accumulation_steps']
                         d_loss_acc += d_loss.item()
@@ -354,8 +354,12 @@ class AttGANTrainer:
                     # Backward pass for discriminator
                     self.scaler.scale(d_loss).backward()
                     
+                    # Zero generator gradients before generator update
+                    self.g_optimizer.zero_grad(set_to_none=True)
+                    
                     with torch.cuda.amp.autocast(enabled=self.config['use_amp']):
-                        # Train Generator
+                        # Generate new fake images for generator training
+                        fake_B = self.G(real_A)
                         g_loss = self.train_generator(real_A, real_B, fake_B)
                         g_loss = g_loss / self.config['gradient_accumulation_steps']
                         g_loss_acc += g_loss.item()
@@ -367,16 +371,16 @@ class AttGANTrainer:
                     del fake_B
                     torch.cuda.empty_cache()
                 
-                # Update weights
+                # Update weights after accumulation
                 self.scaler.step(self.d_optimizer)
                 self.scaler.step(self.g_optimizer)
                 self.scaler.update()
                 
-                # Clear memory every batch
+                # Clear memory periodically
                 if batch_idx % self.config['empty_cache_frequency'] == 0:
                     torch.cuda.empty_cache()
                 
-                # Log with accumulated loss
+                # Log progress
                 if batch_idx % self.config['log_frequency'] == 0:
                     print(f'[GPU {self.gpu_id}] '
                           f'[Epoch {epoch}/{self.config["epochs"]}] '
@@ -595,14 +599,14 @@ class AttGANTrainer:
             return torch.cuda.memory_allocated() / 1024**2, torch.cuda.memory_reserved() / 1024**2
 
     def train_discriminator(self, real_B, fake_B):
-        """Train discriminator with detached fake images"""
+        """Train discriminator"""
         # Real images
         real_validity = self.D(real_B)
         real_labels = torch.ones_like(real_validity).to(self.device)
         d_real_loss = self.adversarial_loss(real_validity, real_labels)
         
-        # Fake images
-        fake_validity = self.D(fake_B.detach())  # Important: detach fake_B
+        # Fake images - already detached from generator
+        fake_validity = self.D(fake_B)
         fake_labels = torch.zeros_like(fake_validity).to(self.device)
         d_fake_loss = self.adversarial_loss(fake_validity, fake_labels)
         
