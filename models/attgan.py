@@ -102,28 +102,87 @@ class Generator(nn.Module):
         )
 
     def forward(self, x, intensity=1.0):
-        # Store skip connections
+        B, C, H, W = x.shape
+        
+        # Process in chunks if image is too large
+        if H > 512 or W > 512:
+            return self.forward_chunks(x, intensity)
+            
+        # Normal forward pass for smaller images
         x0 = self.initial(x)
         x1 = self.down1(x0)
         x2 = self.down2(x1)
         x3 = self.down3(x2)
         
-        # Enhanced wrinkle attention
         wrinkle_mask = self.wrinkle_attention(x3)
         x3 = x3 * (1 + intensity * wrinkle_mask)
         
-        # Apply self-attention for global context
         x3 = self.refine_attention(x3)
-        
-        # Process features
         x3 = self.res_blocks(x3)
         
-        # Precise upsampling with skip connections
         x = self.up3(x3) + x2
         x = self.up2(x) + x1
         x = self.up1(x) + x0
         
         return self.output(x)
+
+    def forward_chunks(self, x, intensity=1.0):
+        """Process large images in chunks"""
+        B, C, H, W = x.shape
+        chunk_size = 512  # Process 512x512 chunks
+        output = torch.zeros_like(x)
+        
+        for h in range(0, H, chunk_size//2):  # 50% overlap
+            for w in range(0, W, chunk_size//2):
+                h_start = h
+                w_start = w
+                h_end = min(h + chunk_size, H)
+                w_end = min(w + chunk_size, W)
+                
+                # Extract chunk with padding
+                pad_h = max(0, chunk_size - (h_end - h_start))
+                pad_w = max(0, chunk_size - (w_end - w_start))
+                chunk = x[:, :, h_start:h_end, w_start:w_end]
+                
+                if pad_h > 0 or pad_w > 0:
+                    chunk = F.pad(chunk, (0, pad_w, 0, pad_h), mode='reflect')
+                
+                # Process chunk
+                with torch.cuda.amp.autocast():
+                    processed_chunk = super().forward(chunk, intensity)
+                
+                # Remove padding
+                if pad_h > 0 or pad_w > 0:
+                    processed_chunk = processed_chunk[:, :, :h_end-h_start, :w_end-w_start]
+                
+                # Blend chunks with overlap
+                if h > 0:  # Blend vertical overlap
+                    blend_h = chunk_size//4
+                    alpha = torch.linspace(0, 1, blend_h).view(1, 1, blend_h, 1).to(x.device)
+                    output[:, :, h:h+blend_h, w_start:w_end] = (
+                        output[:, :, h:h+blend_h, w_start:w_end] * (1 - alpha) +
+                        processed_chunk[:, :, :blend_h, :] * alpha
+                    )
+                    processed_chunk = processed_chunk[:, :, blend_h:, :]
+                    h_start += blend_h
+                
+                if w > 0:  # Blend horizontal overlap
+                    blend_w = chunk_size//4
+                    alpha = torch.linspace(0, 1, blend_w).view(1, 1, 1, blend_w).to(x.device)
+                    output[:, :, h_start:h_end, w:w+blend_w] = (
+                        output[:, :, h_start:h_end, w:w+blend_w] * (1 - alpha) +
+                        processed_chunk[:, :, :, :blend_w] * alpha
+                    )
+                    processed_chunk = processed_chunk[:, :, :, blend_w:]
+                    w_start += blend_w
+                
+                # Copy remaining chunk
+                output[:, :, h_start:h_end, w_start:w_end] = processed_chunk
+                
+                # Clear cache
+                torch.cuda.empty_cache()
+        
+        return output
 
 class ResidualBlock(nn.Module):
     def __init__(self, in_channels, dropout_rate=0.3):

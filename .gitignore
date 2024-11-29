@@ -167,3 +167,4 @@ before_after_256.npz
 /after_mask_0_4.zip
 /after/
 /datasets/
+*.pth

@@ -98,6 +98,42 @@ class Tester:
             results.append(fake_img)
         return results
 
+    def load_checkpoint(self, checkpoint_path):
+        """Load checkpoint with proper error handling"""
+        try:
+            print(f"Attempting to load checkpoint: {checkpoint_path}")
+            
+            # Try different loading methods
+            try:
+                # Method 1: Standard loading
+                checkpoint = torch.load(checkpoint_path, map_location=self.device)
+            except RuntimeError as e1:
+                print(f"Standard loading failed, trying alternative methods...")
+                try:
+                    # Method 2: Try with weights_only=True
+                    checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=True)
+                except Exception as e2:
+                    # Method 3: Try loading with pickle
+                    import pickle
+                    with open(checkpoint_path, 'rb') as f:
+                        checkpoint = pickle.load(f)
+            
+            # Load model state dict
+            self.G.load_state_dict(checkpoint['G_state_dict'])
+            self.G.eval()  # Set to evaluation mode
+            
+            print("Checkpoint loaded successfully")
+            return True
+            
+        except Exception as e:
+            print(f"Failed to load checkpoint: {str(e)}")
+            print("\nTroubleshooting steps:")
+            print("1. Verify the checkpoint file exists and is not corrupted")
+            print("2. Check if the checkpoint was saved properly during training")
+            print("3. Try using an earlier checkpoint")
+            print("4. Verify the model architecture matches the checkpoint")
+            raise RuntimeError(f"Failed to load checkpoint: {str(e)}")
+
 def main():
     parser = argparse.ArgumentParser(description='Test AttGAN on images')
     parser.add_argument('--checkpoint', type=str, required=True, help='Path to checkpoint file')
