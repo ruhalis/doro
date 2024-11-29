@@ -23,19 +23,21 @@ class CustomDataset(Dataset):
         return len(self.A_images)
 
     def __getitem__(self, idx):
+        # Load images with high quality settings
         A_img = Image.open(os.path.join(self.A_path, self.A_images[idx])).convert('RGB')
         B_img = Image.open(os.path.join(self.B_path, self.B_images[idx])).convert('RGB')
         
         if self.transform:
             A_img = self.transform(A_img)
             B_img = self.transform(B_img)
-            
+        
         return A_img, B_img
 
 def get_transforms(image_size):
+    """Minimal transforms for synthetic data"""
     return transforms.Compose([
         transforms.Resize((image_size, image_size), 
-                        interpolation=transforms.InterpolationMode.BILINEAR),
+                        interpolation=transforms.InterpolationMode.BICUBIC),  # High-quality resize
         transforms.ToTensor(),
-        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
     ])

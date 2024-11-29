@@ -61,6 +61,46 @@ class TotalVariationLoss(nn.Module):
         w_tv = torch.abs(x[:, :, :, 1:] - x[:, :, :, :-1]).mean()
         return h_tv + w_tv
 
+def download_and_verify_weights(config, gpu_id):
+    """Download and verify model weights"""
+    if gpu_id == 0:  # Only print on main process
+        print("\nVerifying pre-trained model weights...")
+        
+    try:
+        # Import torchvision here to avoid circular imports
+        from torchvision import models
+        
+        # VGG weights for perceptual loss
+        vgg = models.vgg16(weights=models.VGG16_Weights.IMAGENET1K_V1)
+        if gpu_id == 0:
+            print("✓ VGG16 weights loaded successfully")
+        
+        # Face recognition model
+        face_model = InceptionResnetV1(pretrained='vggface2')
+        if gpu_id == 0:
+            print("✓ FaceNet weights loaded successfully")
+        
+        # MTCNN for face detection
+        mtcnn = MTCNN(device=torch.device(f'cuda:{gpu_id}'))
+        if gpu_id == 0:
+            print("✓ MTCNN weights loaded successfully")
+        
+        # LPIPS
+        loss_fn_alex = lpips.LPIPS(net='alex')
+        if gpu_id == 0:
+            print("✓ LPIPS weights loaded successfully")
+        
+        return True
+        
+    except Exception as e:
+        if gpu_id == 0:  # Only print on main process
+            print(f"❌ Error downloading weights: {str(e)}")
+            print("\nTroubleshooting steps:")
+            print("1. Check internet connection")
+            print("2. Verify torch hub cache directory permissions")
+            print("3. Try clearing the cache: torch.hub.clear_cache()")
+        return False
+
 class AttGANTrainer:
     def __init__(self, config, gpu_id):
         self.gpu_id = gpu_id
@@ -70,7 +110,11 @@ class AttGANTrainer:
         torch.cuda.set_device(gpu_id)
         self.device = torch.device(f'cuda:{gpu_id}')
         
-        # Create models
+        # Verify weights before proceeding
+        if not download_and_verify_weights(config, gpu_id):
+            raise RuntimeError("Failed to download required model weights")
+        
+        # Initialize models
         self.G = Generator().to(self.device)
         self.D = Discriminator().to(self.device)
         
@@ -119,8 +163,18 @@ class AttGANTrainer:
         # Setup data loaders
         self.setup_dataloaders()
         
-        # Add perceptual loss
+        # Initialize face recognition model
+        self.face_model = InceptionResnetV1(pretrained='vggface2').to(self.device)
+        self.face_model.eval()
+        
+        # Initialize MTCNN
+        self.mtcnn = MTCNN(device=self.device)
+        
+        # Initialize perceptual loss
         self.perceptual_loss = VGGPerceptualLoss().to(self.device)
+        
+        # Initialize LPIPS
+        self.lpips_loss = lpips.LPIPS(net='alex').to(self.device)
         
         # Add identity loss
         self.identity_loss = nn.L1Loss()
@@ -132,16 +186,6 @@ class AttGANTrainer:
         except ModuleNotFoundError:
             print("Warning: torch-fidelity not installed. FID calculation will be disabled.")
             self.use_fid = False
-        
-        # Initialize LPIPS for perceptual similarity
-        self.lpips_fn = lpips.LPIPS(net='alex').to(self.device)
-        
-        # Initialize face recognition model
-        self.face_model = InceptionResnetV1(pretrained='vggface2').to(self.device)
-        self.face_model.eval()
-        
-        # Initialize face detection for alignment
-        self.mtcnn = MTCNN(device=self.device)
         
         # Add validation metrics to track
         self.best_fid = float('inf')
@@ -158,13 +202,42 @@ class AttGANTrainer:
         
         self.best_loss = float('inf')
         self.patience_counter = 0
+        
+        # Load pre-trained weights if available
+        if self.gpu_id == 0:  # Only print on main process
+            print("Checking for pre-trained AttGAN weights...")
 
+        try:
+            pretrained_path = 'pretrained/attgan_weights.pth'
+            if os.path.exists(pretrained_path):
+                state_dict = torch.load(pretrained_path, map_location=self.device)
+                
+                # Load weights for Generator and Discriminator
+                if isinstance(self.G, DDP):
+                    self.G.module.load_state_dict(state_dict['G_state_dict'])
+                    self.D.module.load_state_dict(state_dict['D_state_dict'])
+                else:
+                    self.G.load_state_dict(state_dict['G_state_dict'])
+                    self.D.load_state_dict(state_dict['D_state_dict'])
+                    
+                if self.gpu_id == 0:
+                    print("Successfully loaded pre-trained weights")
+            else:
+                if self.gpu_id == 0:
+                    print("No pre-trained weights found. Starting from scratch.")
+        except Exception as e:
+            if self.gpu_id == 0:
+                print(f"Warning: Failed to load pre-trained weights: {str(e)}")
+                print("Starting from scratch.")
+        
+        # Add fixed sample indices for consistent visualization
+        self.fixed_sample_indices = list(range(4))  # Or any specific indices you want to track
+        self.fixed_sample_data = None
+        
     def setup_dataloaders(self):
         transform = transforms.Compose([
-            transforms.Resize((self.config['image_size'], self.config['image_size']), 
+            transforms.Resize((512, 512),
                             interpolation=transforms.InterpolationMode.BICUBIC),
-            transforms.RandomHorizontalFlip(),
-            transforms.ColorJitter(brightness=0.1, contrast=0.1),
             transforms.ToTensor(),
             transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
         ])
@@ -245,26 +318,49 @@ class AttGANTrainer:
         except Exception as e:
             raise RuntimeError(f"Failed to create data loaders on GPU {self.gpu_id}: {str(e)}")
 
-    def train(self):
-        """Main training loop with proper epoch counting and resume capability"""
-        try:
-            # Try to load progress from JSON first
-            progress_file = os.path.join(self.config['checkpoint_dir'], 'training_progress.json')
-            if os.path.exists(progress_file):
-                with open(progress_file, 'r') as f:
-                    progress = json.load(f)
-                    start_epoch = progress.get('current_epoch', 0)
-                    self.best_fid = progress.get('best_fid', float('inf'))
-                    print(f"Resuming from epoch {start_epoch}")
-            else:
-                # If no progress file, try to load from latest checkpoint
-                start_epoch = self.load_checkpoint(os.path.join(
-                    self.config['checkpoint_dir'], 
-                    'latest.pth'
-                ))
+    def setup_validation_samples(self):
+        """Setup a single fixed sample for visualization"""
+        if self.gpu_id == 0:  # Only on main process
+            # Get just one sample from validation set
+            sample = self.val_dataset[0]  # Use first image
+            
+            # Convert single sample to batch
+            real_A = sample[0].unsqueeze(0).to(self.device)  # Add batch dimension
+            real_B = sample[1].unsqueeze(0).to(self.device)
+            self.fixed_sample_data = (real_A, real_B)
+    
+    def save_samples(self, epoch):
+        """Save a single sample with consistent alignment"""
+        if self.gpu_id != 0 or self.fixed_sample_data is None:
+            return
+        
+        self.G.eval()
+        with torch.no_grad():
+            real_A, real_B = self.fixed_sample_data
+            fake_B = self.G(real_A)
+            
+            # Denormalize images properly
+            real_A = (real_A + 1.0) * 0.5  # From [-1,1] to [0,1]
+            fake_B = (fake_B + 1.0) * 0.5
+            real_B = (real_B + 1.0) * 0.5
+            
+            # Create a simple row: [real_A, fake_B, real_B]
+            sample_grid = torch.cat([real_A[0], fake_B[0], real_B[0]], dim=2)  # Concatenate along width
+            
+            # Save image
+            save_image(
+                sample_grid,
+                f"{self.config['sample_dir']}/epoch_{epoch}.png",
+                normalize=False,  # Already normalized to [0,1]
+                value_range=(0, 1)
+            )
+        self.G.train()
 
-            # Main training loop
-            for epoch in range(start_epoch, self.config['epochs']):
+    def train(self):
+        """Main training loop"""
+        try:
+            # Start training from epoch 0
+            for epoch in range(self.config['epochs']):
                 try:
                     print(f"\nStarting epoch {epoch}")
                     self.train_epoch(epoch)
@@ -273,28 +369,21 @@ class AttGANTrainer:
                     if epoch % self.config['val_frequency'] == 0:
                         self.validate(epoch)
                     
-                    # Save checkpoint with correct epoch number
+                    # Save checkpoint
                     if epoch % self.config['save_frequency'] == 0:
                         self.save_checkpoint(epoch)
                     
-                    # Always save latest checkpoint and progress
-                    self.save_checkpoint(epoch, filename='latest.pth')
-                    self.save_training_progress(epoch)
-                    
                 except Exception as e:
                     print(f"Error during epoch {epoch}: {str(e)}")
-                    # Save checkpoint on error
                     self.save_checkpoint(epoch, filename=f'error_epoch_{epoch}.pth')
                     raise e
 
         except KeyboardInterrupt:
             print("\nTraining interrupted by user")
-            # Save checkpoint on interrupt
             self.save_checkpoint(epoch, filename='interrupt.pth')
             
         except Exception as e:
             print(f"\nTraining failed with error: {str(e)}")
-            # Save checkpoint on error
             if 'epoch' in locals():
                 self.save_checkpoint(epoch, filename='error.pth')
             raise e
@@ -511,9 +600,9 @@ class AttGANTrainer:
     def save_validation_images(self, epoch, real_A, fake_B, real_B):
         """Save sample validation images"""
         # Denormalize images from [-1, 1] to [0, 1]
-        real_A = self.denormalize(real_A)
-        fake_B = self.denormalize(fake_B)
-        real_B = self.denormalize(real_B)
+        real_A = (real_A + 1.0) * 0.5
+        fake_B = (fake_B + 1.0) * 0.5
+        real_B = (real_B + 1.0) * 0.5
         
         # Make a grid of images
         img_sample = torch.cat((real_A.data, fake_B.data, real_B.data), -2)
@@ -529,14 +618,15 @@ class AttGANTrainer:
             img_sample, 
             save_path,
             nrow=self.config['batch_size'],
-            normalize=True  # Only normalize, no range
+            normalize=False,  # Already normalized
+            value_range=(0, 1)
         )
         
         # Log images to tensorboard if enabled
         if hasattr(self, 'writer'):
             self.writer.add_image(
                 'Validation/real_A_fake_B_real_B', 
-                img_sample[0],  # Take first image from batch
+                img_sample[0],
                 epoch,
                 dataformats='CHW'
             )
@@ -586,7 +676,7 @@ class AttGANTrainer:
     def compute_lpips_distance(self, real_images, fake_images):
         """Compute LPIPS perceptual distance"""
         with torch.no_grad():
-            distance = self.lpips_fn(real_images, fake_images)
+            distance = self.lpips_loss(real_images, fake_images)
             return distance.mean().item()
 
     def clear_gpu_memory(self):
@@ -615,20 +705,24 @@ class AttGANTrainer:
         return d_loss
 
     def train_generator(self, real_A, real_B, fake_B):
-        """Train generator"""
-        # Adversarial loss
+        """Train generator with focus on precise wrinkle removal"""
+        # High weights for reconstruction and identity
+        g_rec_loss = self.reconstruction_loss(fake_B, real_B)  # L1 loss for precise pixel matching
+        g_identity_loss = self.identity_loss(fake_B, real_B)   # Identity preservation
+        g_perceptual_loss = self.perceptual_loss(fake_B, real_B)  # Texture preservation
+        
+        # Adversarial loss - less important for synthetic data
         fake_validity = self.D(fake_B)
         real_labels = torch.ones_like(fake_validity).to(self.device)
         g_adv_loss = self.adversarial_loss(fake_validity, real_labels)
         
-        # Other losses
-        g_rec_loss = self.reconstruction_loss(fake_B, real_B)
-        g_perceptual_loss = self.perceptual_loss(fake_B, real_B)
-        g_identity_loss = self.identity_loss(fake_B, real_B)
+        # Sharpness loss with focus on wrinkle areas
         g_sharpness_loss = self.sharpness_loss(fake_B)
+        
+        # Refined total variation loss
         g_tv_loss = self.tv_loss(fake_B)
         
-        # Combine losses
+        # Combined loss with adjusted weights
         g_loss = (
             self.config['lambda_adv'] * g_adv_loss +
             self.config['lambda_rec'] * g_rec_loss +
@@ -639,85 +733,6 @@ class AttGANTrainer:
         )
         
         return g_loss
-
-    def load_checkpoint(self, checkpoint_path):
-        """Enhanced checkpoint loading with better error handling"""
-        try:
-            if os.path.exists(checkpoint_path):
-                print(f"Loading checkpoint: {checkpoint_path}")
-                checkpoint = torch.load(checkpoint_path, map_location=self.device)
-                
-                # Load model states
-                self.G.module.load_state_dict(checkpoint['G_state_dict']) if isinstance(self.G, DDP) \
-                    else self.G.load_state_dict(checkpoint['G_state_dict'])
-                self.D.module.load_state_dict(checkpoint['D_state_dict']) if isinstance(self.D, DDP) \
-                    else self.D.load_state_dict(checkpoint['D_state_dict'])
-                
-                # Load optimizer states
-                self.g_optimizer.load_state_dict(checkpoint['g_optimizer'])
-                self.d_optimizer.load_state_dict(checkpoint['d_optimizer'])
-                
-                # Get epoch number
-                start_epoch = checkpoint.get('epoch', 0) + 1  # Start from next epoch
-                
-                print(f"Successfully loaded checkpoint from epoch {start_epoch-1}")
-                return start_epoch
-                
-            else:
-                print("No checkpoint found, starting from scratch")
-                return 0
-                
-        except Exception as e:
-            print(f"Error loading checkpoint: {e}")
-            print("Starting from scratch")
-            return 0
-
-    def log_training_progress(self, epoch, g_loss, d_loss):
-        """Log training progress to CSV with correct epoch numbers"""
-        stats = {
-            'epoch': epoch,
-            'g_loss': g_loss.item(),
-            'd_loss': d_loss.item(),
-            'timestamp': time.time(),
-            'learning_rate': self.g_optimizer.param_groups[0]['lr']
-        }
-        
-        # Save to CSV
-        df = pd.DataFrame([stats])
-        log_file = 'training_log.csv'
-        df.to_csv(log_file, 
-                  mode='a', 
-                  header=not os.path.exists(log_file),
-                  index=False)
-        
-        # Also save current epoch to a JSON file for easy recovery
-        progress = {
-            'current_epoch': epoch,
-            'best_fid': self.best_fid,
-            'last_update': time.strftime('%Y-%m-%d %H:%M:%S')
-        }
-        with open('training_progress.json', 'w') as f:
-            json.dump(progress, f, indent=4)
-
-    def save_training_progress(self, epoch):
-        """Save training progress to JSON"""
-        progress = {
-            'current_epoch': epoch + 1,  # Save next epoch to resume from
-            'best_fid': self.best_fid,
-            'last_update': time.strftime('%Y-%m-%d %H:%M:%S'),
-            'training_params': {
-                'learning_rate': self.g_optimizer.param_groups[0]['lr'],
-                'batch_size': self.config['batch_size'],
-                'image_size': self.config['image_size']
-            }
-        }
-        
-        progress_file = os.path.join(self.config['checkpoint_dir'], 'training_progress.json')
-        try:
-            with open(progress_file, 'w') as f:
-                json.dump(progress, f, indent=4)
-        except Exception as e:
-            print(f"Warning: Could not save progress file: {e}")
 
 def setup(rank, world_size, config):
     os.environ['MASTER_PORT'] = '12356'
@@ -737,6 +752,10 @@ def cleanup():
 
 def main(rank, world_size, config):
     try:
+        # Update config with process-specific info
+        config['rank'] = rank
+        config['world_size'] = world_size
+        
         # Set up error handling for CUDA devices
         torch.cuda.set_device(rank)
         
@@ -751,7 +770,6 @@ def main(rank, world_size, config):
     except Exception as e:
         print(f"Error in rank {rank}: {str(e)}")
         raise e
-    
     finally:
         if dist.is_initialized():
             cleanup()
@@ -766,21 +784,21 @@ if __name__ == "__main__":
         'log_dir': 'logs',
         
         # Training parameters - Adjusted for high resolution
-        'batch_size': 1,                    # Reduced from 2
-        'num_workers': 1,                   # Reduce worker threads
+        'batch_size': 4,                    # Reduced from 2
+        'num_workers': 2,                   # Reduce worker threads
         'lr': 0.00001,            # Keep low learning rate for stability
         'beta1': 0.5,
         'beta2': 0.999,
         'epochs': 200,
         
         # Model parameters - Tuned for high resolution
-        'image_size': 1024,        # Increased resolution
-        'lambda_adv': 0.01,        # Reduced for better stability at high resolution
-        'lambda_rec': 45.0,        # Increased reconstruction weight
-        'lambda_perceptual': 10.0, # Reduced to prevent over-emphasis on perceptual features
-        'lambda_identity': 25.0,   # Increased for better identity preservation
-        'lambda_sharpness': 0.8,   # Reduced to prevent over-sharpening at high res
-        'lambda_tv': 0.05,         # Reduced TV loss for high res
+        'image_size': 512,        # Change from 1024 to 512
+        'lambda_adv': 0.005,        # Low adversarial weight for precise matching
+        'lambda_rec': 45.0,         # High reconstruction weight
+        'lambda_perceptual': 15.0,  # Strong perceptual loss
+        'lambda_identity': 25.0,    # Strong identity preservation
+        'lambda_sharpness': 0.8,    # Moderate sharpness for detail
+        'lambda_tv': 0.02,          # Low TV loss to prevent over-smoothing
         
         # Memory optimization - Critical for 1024x1024
         'use_amp': True,           # Keep AMP enabled
@@ -819,6 +837,15 @@ if __name__ == "__main__":
         # Memory cleanup
         'empty_cache_frequency': 1,         # Clear cache more frequently
         'process_chunk_size': 512,         # New parameter for image processing
+        'warmup_epochs': 3,
+        'warmup_lr_factor': 0.1,
+        'torch_hub_dir': 'pretrained_weights',  # Custom directory for downloaded weights
+        'clear_cache_on_start': False,          # Whether to clear existing cache
+        
+        # Added parameters for image quality
+        'normalize_samples': False,  # Since we handle normalization manually
+        'sample_value_range': (0, 1),
+        'use_tanh_output': True,
     }
 
     # Create necessary directories

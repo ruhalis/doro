@@ -3,95 +3,127 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class Generator(nn.Module):
-    def __init__(self, input_channels=3, output_channels=3, base_filters=32):
+    def __init__(self, input_channels=3, output_channels=3, base_filters=64):
         super(Generator, self).__init__()
         
-        # Initial convolution block
+        # Initial convolution block with more precise feature extraction
         self.initial = nn.Sequential(
             nn.Conv2d(input_channels, base_filters, 7, padding=3),
             nn.InstanceNorm2d(base_filters),
             nn.ReLU(inplace=True),
-            nn.Dropout2d(0.1)
+            nn.Conv2d(base_filters, base_filters, 3, padding=1)
         )
         
-        # Downsampling
+        # Downsampling with skip connections
         self.down1 = nn.Sequential(
             nn.Conv2d(base_filters, base_filters*2, 3, stride=2, padding=1),
             nn.InstanceNorm2d(base_filters*2),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(base_filters*2, base_filters*2, 3, padding=1),  # Additional conv
+            nn.InstanceNorm2d(base_filters*2),
             nn.ReLU(inplace=True)
         )
+        
         self.down2 = nn.Sequential(
             nn.Conv2d(base_filters*2, base_filters*4, 3, stride=2, padding=1),
             nn.InstanceNorm2d(base_filters*4),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(base_filters*4, base_filters*4, 3, padding=1),  # Additional conv
+            nn.InstanceNorm2d(base_filters*4),
             nn.ReLU(inplace=True)
         )
+        
         self.down3 = nn.Sequential(
             nn.Conv2d(base_filters*4, base_filters*8, 3, stride=2, padding=1),
+            nn.InstanceNorm2d(base_filters*8),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(base_filters*8, base_filters*8, 3, padding=1),  # Additional conv
             nn.InstanceNorm2d(base_filters*8),
             nn.ReLU(inplace=True)
         )
         
-        # Add attention mechanism
-        self.attention = SelfAttentionBlock(base_filters*8)
-        
-        # Residual blocks
-        self.res_blocks = nn.Sequential(
-            ResidualBlock(base_filters*8, dropout_rate=0.2),
-            ResidualBlock(base_filters*8, dropout_rate=0.2),
-            self.attention,  # Add attention after some residual blocks
-            ResidualBlock(base_filters*8, dropout_rate=0.2),
-            ResidualBlock(base_filters*8, dropout_rate=0.2)
+        # Enhanced wrinkle attention mechanism
+        self.wrinkle_attention = nn.Sequential(
+            nn.Conv2d(base_filters*8, base_filters*8, 1),
+            nn.InstanceNorm2d(base_filters*8),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(base_filters*8, base_filters*8, 1),
+            nn.Sigmoid()
         )
         
-        # Upsampling with correct channel sizes
+        # Multi-scale feature refinement
+        self.refine_attention = SelfAttentionBlock(base_filters*8)
+        
+        # More residual blocks for better feature processing
+        self.res_blocks = nn.Sequential(
+            ResidualBlock(base_filters*8, dropout_rate=0.1),  # Reduced dropout
+            ResidualBlock(base_filters*8, dropout_rate=0.1),
+            ResidualBlock(base_filters*8, dropout_rate=0.1),
+            ResidualBlock(base_filters*8, dropout_rate=0.1),
+            ResidualBlock(base_filters*8, dropout_rate=0.1),
+            ResidualBlock(base_filters*8, dropout_rate=0.1)
+        )
+        
+        # Precise upsampling path
         self.up3 = nn.Sequential(
             nn.ConvTranspose2d(base_filters*8, base_filters*4, 3, stride=2, padding=1, output_padding=1),
             nn.InstanceNorm2d(base_filters*4),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(base_filters*4, base_filters*4, 3, padding=1),  # Additional conv
+            nn.InstanceNorm2d(base_filters*4),
             nn.ReLU(inplace=True)
         )
+        
         self.up2 = nn.Sequential(
             nn.ConvTranspose2d(base_filters*4, base_filters*2, 3, stride=2, padding=1, output_padding=1),
             nn.InstanceNorm2d(base_filters*2),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(base_filters*2, base_filters*2, 3, padding=1),  # Additional conv
+            nn.InstanceNorm2d(base_filters*2),
             nn.ReLU(inplace=True)
         )
+        
         self.up1 = nn.Sequential(
             nn.ConvTranspose2d(base_filters*2, base_filters, 3, stride=2, padding=1, output_padding=1),
+            nn.InstanceNorm2d(base_filters),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(base_filters, base_filters, 3, padding=1),  # Additional conv
             nn.InstanceNorm2d(base_filters),
             nn.ReLU(inplace=True)
         )
         
-        # Output convolution
+        # Refined output for precise skin texture
         self.output = nn.Sequential(
+            nn.Conv2d(base_filters, base_filters, 3, padding=1),
+            nn.InstanceNorm2d(base_filters),
+            nn.ReLU(inplace=True),
             nn.Conv2d(base_filters, output_channels, 7, padding=3),
             nn.Tanh()
         )
 
-    def forward(self, x):
-        # Encoding
-        x = self.initial(x)
-        x = self.down1(x)
-        x = self.down2(x)
-        x = self.down3(x)
+    def forward(self, x, intensity=1.0):
+        # Store skip connections
+        x0 = self.initial(x)
+        x1 = self.down1(x0)
+        x2 = self.down2(x1)
+        x3 = self.down3(x2)
         
-        # Residual blocks
-        x = self.res_blocks(x)
+        # Enhanced wrinkle attention
+        wrinkle_mask = self.wrinkle_attention(x3)
+        x3 = x3 * (1 + intensity * wrinkle_mask)
         
-        # Decoding (in correct order)
-        x = self.up3(x)
-        x = self.up2(x)
-        x = self.up1(x)
+        # Apply self-attention for global context
+        x3 = self.refine_attention(x3)
         
-        # Add high-frequency enhancement
-        output = self.output(x)
-        enhanced = self.enhance_high_frequency(output)
-        return enhanced
-    
-    def enhance_high_frequency(self, x):
-        # Apply unsharp masking
-        blur = F.avg_pool2d(x, kernel_size=3, stride=1, padding=1)
-        high_freq = x - blur
-        sharpened = x + 0.5 * high_freq  # Adjust factor (0.5) to control sharpening intensity
-        return sharpened
+        # Process features
+        x3 = self.res_blocks(x3)
+        
+        # Precise upsampling with skip connections
+        x = self.up3(x3) + x2
+        x = self.up2(x) + x1
+        x = self.up1(x) + x0
+        
+        return self.output(x)
 
 class ResidualBlock(nn.Module):
     def __init__(self, in_channels, dropout_rate=0.3):

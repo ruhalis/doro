@@ -6,6 +6,8 @@ from models.attgan import Generator
 import argparse
 from tqdm import tqdm
 import gc  # for garbage collection
+import numpy as np
+import torch.nn.functional as F
 
 class Tester:
     def __init__(self, checkpoint_path, device='cuda'):
@@ -50,37 +52,51 @@ class Tester:
         ])
 
     @torch.no_grad()
-    def process_image(self, image_path, save_path):
-        try:
-            # Load and preprocess image
-            img = Image.open(image_path).convert('RGB')
-            img_tensor = self.transform(img).unsqueeze(0).to(self.device)
-            
-            # Process through generator
-            with torch.cuda.amp.autocast():  # Use mixed precision for better performance
-                fake_img = self.G(img_tensor)
-            
-            # Move to CPU and convert to PIL
-            fake_img = fake_img.cpu()
-            fake_img = self.inverse_transform(fake_img.squeeze(0))
-            
-            # Save the result
-            fake_img.save(save_path)
-            
-            # Clear GPU memory
-            self.clear_gpu_memory()
-            
-            return True
-        except Exception as e:
-            print(f"Error processing {image_path}: {str(e)}")
-            self.clear_gpu_memory()
-            return False
+    def process_image(self, image_path):
+        # Load 1024x1024 image
+        img = Image.open(image_path).convert('RGB')
+        
+        # Process at 512x512
+        img_512 = transforms.Resize((512, 512))(img)
+        img_tensor = self.transform(img_512).unsqueeze(0)
+        
+        # Generate result
+        with torch.no_grad():
+            result = self.G(img_tensor)
+        
+        # Upscale result back to 1024x1024 if needed
+        result_1024 = F.interpolate(
+            result, 
+            size=(1024, 1024), 
+            mode='bicubic',
+            align_corners=False
+        )
 
     def clear_gpu_memory(self):
         """Clear GPU memory cache"""
         if self.device == 'cuda':
             torch.cuda.empty_cache()
             gc.collect()
+
+    def process_batch(self, images):
+        # Process multiple images at once
+        pass
+
+    def test_with_sliding(self, image, attribute, min_intensity=-1.0, max_intensity=1.0, steps=10):
+        """
+        Test with sliding attribute intensity
+        Args:
+            attribute: attribute to modify
+            min_intensity: minimum intensity value
+            max_intensity: maximum intensity value
+            steps: number of steps between min and max
+        """
+        intensities = np.linspace(min_intensity, max_intensity, steps)
+        results = []
+        for intensity in intensities:
+            fake_img = self.G(image, attribute, intensity)
+            results.append(fake_img)
+        return results
 
 def main():
     parser = argparse.ArgumentParser(description='Test AttGAN on images')
