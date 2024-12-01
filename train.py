@@ -9,7 +9,6 @@ from torch.utils.data import DataLoader
 from torchvision import transforms
 from torchvision.utils import save_image
 from torch.utils.tensorboard import SummaryWriter
-import os
 from PIL import Image
 import numpy as np
 from models.attgan import Generator, Discriminator
@@ -19,10 +18,8 @@ import pandas as pd
 import time
 from models.vgg_perceptual_loss import VGGPerceptualLoss
 import torch.nn.functional as F
-from torchmetrics.image.inception import InceptionScore
 from torchmetrics.image.fid import FrechetInceptionDistance
 from facenet_pytorch import InceptionResnetV1, MTCNN
-from sklearn.metrics import mean_squared_error
 import lpips
 from torch.cuda.amp import GradScaler
 import datetime
@@ -30,7 +27,13 @@ import json
 from torch.optim.lr_scheduler import LambdaLR
 import shutil
 import traceback
+import warnings
+import torchvision
 
+# Suppress warnings
+warnings.filterwarnings("ignore", category=UserWarning)
+
+# Custom Loss Functions
 class SharpenessLoss(nn.Module):
     def __init__(self):
         super(SharpenessLoss, self).__init__()
@@ -39,179 +42,182 @@ class SharpenessLoss(nn.Module):
             [1, -4, 1],
             [0, 1, 0]
         ], dtype=torch.float32).view(1, 1, 3, 3)
-        
+
     def forward(self, x):
         # Convert to grayscale if input is RGB
         if x.shape[1] == 3:
-            x = 0.299 * x[:, 0] + 0.587 * x[:, 1] + 0.114 * x[:, 2]
-            x = x.unsqueeze(1)
-        
+            x = 0.299 * x[:, 0:1] + 0.587 * x[:, 1:2] + 0.114 * x[:, 2:3]
         # Apply Laplacian filter
         laplacian_kernel = self.laplacian_kernel.to(x.device)
-        laplacian_kernel = laplacian_kernel.repeat(1, x.shape[1], 1, 1)
         edge_map = F.conv2d(x, laplacian_kernel, padding=1)
-        
         # Encourage stronger edges (negative loss because we want to maximize sharpness)
         return -torch.mean(torch.abs(edge_map))
 
 class TotalVariationLoss(nn.Module):
     def __init__(self):
         super(TotalVariationLoss, self).__init__()
-        
+
     def forward(self, x):
         # Calculate gradients
         h_tv = torch.abs(x[:, :, 1:, :] - x[:, :, :-1, :]).mean()
         w_tv = torch.abs(x[:, :, :, 1:] - x[:, :, :, :-1]).mean()
         return h_tv + w_tv
 
-def download_and_verify_weights(config, gpu_id):
-    """Download and verify model weights"""
-    if gpu_id == 0:  # Only print on main process
-        print("\nVerifying pre-trained model weights...")
-        
-    try:
-        # Import torchvision here to avoid circular imports
-        from torchvision import models
-        
-        # VGG weights for perceptual loss
-        vgg = models.vgg16(weights=models.VGG16_Weights.IMAGENET1K_V1)
-        if gpu_id == 0:
-            print("✓ VGG16 weights loaded successfully")
-        
-        # Face recognition model
-        face_model = InceptionResnetV1(pretrained='vggface2')
-        if gpu_id == 0:
-            print("✓ FaceNet weights loaded successfully")
-        
-        # MTCNN for face detection
-        mtcnn = MTCNN(device=torch.device(f'cuda:{gpu_id}'))
-        if gpu_id == 0:
-            print("✓ MTCNN weights loaded successfully")
-        
-        # LPIPS
-        loss_fn_alex = lpips.LPIPS(net='alex')
-        if gpu_id == 0:
-            print("✓ LPIPS weights loaded successfully")
-        
-        return True
-        
-    except Exception as e:
-        if gpu_id == 0:  # Only print on main process
-            print(f"❌ Error downloading weights: {str(e)}")
-            print("\nTroubleshooting steps:")
-            print("1. Check internet connection")
-            print("2. Verify torch hub cache directory permissions")
-            print("3. Try clearing the cache: torch.hub.clear_cache()")
-        return False
+# **Added Hinge Loss Class**
+class HingeLoss(nn.Module):
+    def __init__(self):
+        super(HingeLoss, self).__init__()
+
+    def forward(self, logits, is_real):
+        if is_real:
+            # For real images, we want logits to be greater than or equal to 1
+            loss = torch.mean(F.relu(1.0 - logits))
+        else:
+            # For fake images, we want logits to be less than or equal to -1
+            loss = torch.mean(F.relu(1.0 + logits))
+        return loss
+
+def setup(rank, world_size):
+    # Set environment variables for master address and port
+    os.environ['MASTER_ADDR'] = '127.0.0.1'
+    os.environ['MASTER_PORT'] = '12356'
+
+    # Initialize process group
+    dist.init_process_group(
+        backend='nccl',
+        world_size=world_size,
+        rank=rank
+    )
+
+    # Set device for this process
+    torch.cuda.set_device(rank)
+
+def cleanup():
+    dist.destroy_process_group()
+
+def get_linear_warmup_scheduler(optimizer, warmup_epochs):
+    def lr_lambda(current_epoch):
+        if current_epoch < warmup_epochs:
+            return float(current_epoch) / float(max(1, warmup_epochs))
+        return 1.0
+    return LambdaLR(optimizer, lr_lambda)
 
 class AttGANTrainer:
     def __init__(self, config, gpu_id):
         """Initialize trainer with proper use of all config parameters"""
         self.config = config
         self.gpu_id = gpu_id
-        
-        # Set up device
         self.device = torch.device(f'cuda:{gpu_id}')
-        
+        torch.cuda.set_device(self.device)
+
         # Clear CUDA cache if configured
         if self.config['clear_cache_on_start']:
             torch.cuda.empty_cache()
-        
-        # Set custom torch hub directory
-        if self.config['torch_hub_dir']:
-            torch.hub.set_dir(self.config['torch_hub_dir'])
-        
+
         # Initialize models and move to device
         self.initialize_models()
-        
+
         # Setup data loaders with proper normalization
         self.setup_dataloaders()
-        
+
         # Initialize losses and metrics
         self.initialize_losses()
-        
+
+        # Initialize optimizers
+        self.initialize_optimizers()
+
+        # Initialize learning rate scheduler
+        self.initialize_lr_scheduler()
+
+        # Initialize mixed precision scaler
+        self.scaler = GradScaler(enabled=self.config['use_amp'])
+
+        # Initialize TensorBoard writer
+        if self.gpu_id == 0:
+            self.writer = SummaryWriter(self.config['log_dir'])
+
         # Load pretrained weights
-        self.load_pretrained_weights()
-        
-        # Calculate adaptive logging frequency
-        self.calculate_logging_frequency()
+        self.start_epoch = self.load_pretrained_weights()
+
+        # Initialize best score for early stopping
+        self.best_score = float('inf')
+        self.patience_counter = 0
+
+        # Initialize global step for logging
+        self.global_step = 0
+
+        # **Initialize Hinge Loss instead of BCE**
+        self.adversarial_loss = HingeLoss()
+        self.reconstruction_loss = nn.L1Loss()
 
     def initialize_models(self):
         """Initialize models with proper configuration"""
-        self.G = Generator(
-            input_channels=3,
-            output_channels=3,
-            base_filters=64
-        ).to(self.device)
-        
-        self.D = Discriminator(
-            input_channels=3,
-            base_filters=64
-        ).to(self.device)
-        
+        # **Apply spectral normalization to the discriminator in the model definition**
+        self.G = Generator().to(self.device)
+        self.D = Discriminator().to(self.device)
+
         if self.config['world_size'] > 1:
-            self.G = DDP(self.G, device_ids=[self.gpu_id])
-            self.D = DDP(self.D, device_ids=[self.gpu_id])
+            self.G = DDP(self.G, device_ids=[self.gpu_id], output_device=self.gpu_id)
+            self.D = DDP(self.D, device_ids=[self.gpu_id], output_device=self.gpu_id)
 
     def setup_dataloaders(self):
         """Setup dataloaders with optimized loading parameters"""
-        # Calculate optimal number of workers
-        num_workers = min(
-            os.cpu_count(),
-            self.config['max_workers_per_gpu'] * torch.cuda.device_count()
+        num_workers = self.config['num_workers'] if self.config['num_workers'] is not None else 0
+
+        # **Added data augmentations in transforms**
+        transform = get_transforms(
+            image_size=self.config['image_size'],
+            normalize=self.config['normalize_samples'],
+            mean=self.config['normalization_mean'],
+            std=self.config['normalization_std']
         )
-        
-        transform_kwargs = {
-            'image_size': self.config['image_size'],
-            'normalize': self.config['normalize_samples'],
-            'value_range': self.config['sample_value_range']
-        }
-        
+
+
+        # In AttGANTrainer.setup_dataloaders()
         train_dataset = CustomDataset(
             self.config['dataset_path'],
-            transform=get_transforms(**transform_kwargs, is_train=True)
+            phase='train',
+            transform=transform,
+            augment=self.config.get('augment_synthetic_data', False)  # Pass augment flag here
         )
-        
+
         val_dataset = CustomDataset(
             self.config['dataset_path'],
-            transform=get_transforms(**transform_kwargs, is_train=False)
+            phase='val',
+            transform=transform,
+            augment=False  # Do not augment validation data
         )
-        
+
+
+
         # Set up samplers for distributed training
         train_sampler = DistributedSampler(train_dataset) if self.config['world_size'] > 1 else None
         val_sampler = DistributedSampler(val_dataset, shuffle=False) if self.config['world_size'] > 1 else None
-        
-        # Configure DataLoader with optimized settings
+
+        # Configure DataLoader
         dataloader_kwargs = {
             'batch_size': self.config['batch_size'],
             'num_workers': num_workers,
-            'pin_memory': True,
-            'prefetch_factor': self.config['prefetch_factor'],
-            'persistent_workers': True,  # Keep workers alive between epochs
-            'drop_last': True,  # Prevent issues with incomplete batches
+            'pin_memory': self.config['dataloader']['pin_memory'],
+            'drop_last': self.config['dataloader']['drop_last'],
+            'persistent_workers': self.config['dataloader']['persistent_workers'],
+            'prefetch_factor': self.config['prefetch_factor']
         }
-        
-        if torch.cuda.is_available():
-            # Enable non-blocking memory transfers
-            dataloader_kwargs.update({
-                'pin_memory_device': f'cuda:{self.gpu_id}',
-                'pin_memory': True
-            })
-        
+
         self.train_loader = DataLoader(
             train_dataset,
             shuffle=(train_sampler is None),
             sampler=train_sampler,
             **dataloader_kwargs
         )
-        
+
         self.val_loader = DataLoader(
             val_dataset,
             shuffle=False,
             sampler=val_sampler,
             **dataloader_kwargs
         )
-        
+
         if self.gpu_id == 0:
             print(f"\nDataLoader Configuration:")
             print(f"  Number of workers: {num_workers}")
@@ -220,92 +226,76 @@ class AttGANTrainer:
             print(f"  Training samples: {len(train_dataset)}")
             print(f"  Validation samples: {len(val_dataset)}")
 
-    def normalize_batch(self, batch):
-        """Normalize batch according to config settings"""
-        if not self.config['normalize_samples']:
-            return batch
-        
-        min_val, max_val = self.config['sample_value_range']
-        return (batch - min_val) / (max_val - min_val) * 2 - 1
-
-    def denormalize_batch(self, batch):
-        """Denormalize batch according to config settings"""
-        if not self.config['normalize_samples']:
-            return batch
-        
-        min_val, max_val = self.config['sample_value_range']
-        return (batch + 1) / 2 * (max_val - min_val) + min_val
-
     def initialize_losses(self):
         """Initialize losses with face recognition components"""
-        try:
-            # Initialize face detection and recognition
-            self.mtcnn = MTCNN(
-                image_size=self.config['image_size'],
-                margin=0,
-                device=self.device,
-                keep_all=True
-            ).to(self.device)
-            
-            self.face_model = InceptionResnetV1(
-                pretrained='vggface2',
-                device=self.device
-            ).to(self.device)
-            self.face_model.eval()
-            
-            # Other losses initialization
-            self.perceptual_loss = VGGPerceptualLoss().to(self.device)
-            self.sharpness_loss = SharpenessLoss().to(self.device)
-            self.tv_loss = TotalVariationLoss().to(self.device)
-            self.lpips_loss = lpips.LPIPS(net='alex').to(self.device)
-            
-            # Initialize face recognition loss weights
-            self.identity_weight = self.config['lambda_identity']
-            self.face_alignment_weight = self.config['lambda_face_alignment']
-            
-        except Exception as e:
-            if self.gpu_id == 0:
-                print(f"Error initializing face recognition: {str(e)}")
-            raise
+        # Face recognition model
+        self.face_model = InceptionResnetV1(pretrained='vggface2', classify=False).eval().to(self.device)
+
+        # Freeze face model parameters
+        for param in self.face_model.parameters():
+            param.requires_grad = False
+
+        # MTCNN for face alignment (if needed)
+        # self.mtcnn = MTCNN(device=self.device)
+
+        # Perceptual loss
+        self.perceptual_loss = VGGPerceptualLoss().to(self.device)
+
+        # LPIPS loss
+        self.lpips_loss = lpips.LPIPS(net='alex').to(self.device)
+
+        # Sharpness and total variation loss
+        self.sharpness_loss = SharpenessLoss().to(self.device)
+        self.tv_loss = TotalVariationLoss().to(self.device)
+
+        # FID metric
+        self.fid = FrechetInceptionDistance(normalize=True).to(self.device)
+
+    def initialize_optimizers(self):
+        """Initialize optimizers"""
+        self.g_optimizer = torch.optim.Adam(
+            self.G.parameters(),
+            lr=self.config['lr'],
+            betas=(self.config['beta1'], self.config['beta2'])
+        )
+        self.d_optimizer = torch.optim.Adam(
+            self.D.parameters(),
+            lr=self.config['lr'],
+            betas=(self.config['beta1'], self.config['beta2'])
+        )
+
+    # In initialize_lr_scheduler method
+    def initialize_lr_scheduler(self):
+        if self.config['use_lr_scheduler']:
+            if self.config['lr_scheduler_type'] == 'StepLR':
+                self.g_scheduler = torch.optim.lr_scheduler.StepLR(
+                    self.g_optimizer,
+                    step_size=self.config['lr_step_size'],
+                    gamma=self.config['lr_gamma']
+                )
+                self.d_scheduler = torch.optim.lr_scheduler.StepLR(
+                    self.d_optimizer,
+                    step_size=self.config['lr_step_size'],
+                    gamma=self.config['lr_gamma']
+                )
+        # Add other scheduler types if needed
 
     def load_pretrained_weights(self):
         """Load pretrained weights with comprehensive error handling"""
         if self.gpu_id == 0:
             print("\nLoading pretrained weights...")
-        
+
         try:
-            # First, try loading from resume checkpoint if specified
             if self.config['resume_from_checkpoint']:
-                checkpoint_path = os.path.join(
-                    self.config['checkpoint_dir'],
-                    f"checkpoint_epoch_{self.config['resume_from_checkpoint']}.pth"
-                )
+                checkpoint_path = self.config['resume_from_checkpoint']
                 if os.path.exists(checkpoint_path):
                     return self.load_checkpoint(checkpoint_path)
-            
-            # If no resume checkpoint, try loading pretrained weights
-            pretrained_paths = [
-                self.config.get('pretrained_weights_path', ''),  # User-specified path
-                'pretrained/attgan_weights.pth',                 # Default path
-                os.path.join(self.config['checkpoint_dir'], 'best_model.pth')  # Best model path
-            ]
-            
-            for path in pretrained_paths:
-                if path and os.path.exists(path):
-                    if self.gpu_id == 0:
-                        print(f"Loading pretrained weights from: {path}")
-                    return self.load_checkpoint(path)
-            
-            # If no weights found, provide instructions
+
+            # No pretrained weights found
             if self.gpu_id == 0:
-                print("\nNo pretrained weights found. To use pretrained weights:")
-                print("1. Download weights from: https://github.com/your-repo/weights")
-                print("2. Place them in the 'pretrained' directory")
-                print("3. Or specify custom path in config['pretrained_weights_path']")
-                print("\nStarting training from scratch...")
-            
+                print("\nNo pretrained weights found. Starting training from scratch...")
             return 0  # Start from epoch 0
-            
+
         except Exception as e:
             if self.gpu_id == 0:
                 print(f"\nError loading pretrained weights: {str(e)}")
@@ -317,50 +307,33 @@ class AttGANTrainer:
         try:
             if self.gpu_id == 0:
                 print(f"\nLoading checkpoint: {checkpoint_path}")
-            
-            # Try different loading strategies
-            try:
-                checkpoint = torch.load(checkpoint_path, map_location=self.device)
-            except RuntimeError as e:
-                if "unexpected key" in str(e):
-                    # Try loading with strict=False
-                    checkpoint = torch.load(
-                        checkpoint_path,
-                        map_location=self.device,
-                        weights_only=True
-                    )
-                else:
-                    raise
-            
-            # Verify checkpoint contents
-            required_keys = ['G_state_dict', 'D_state_dict']
-            if not all(key in checkpoint for key in required_keys):
-                raise ValueError(f"Checkpoint missing required keys: {required_keys}")
-            
-            # Load model states with version checking
+
+            checkpoint = torch.load(checkpoint_path, map_location=self.device)
+
+            # Load model states
             if isinstance(self.G, DDP):
                 self.G.module.load_state_dict(checkpoint['G_state_dict'], strict=False)
                 self.D.module.load_state_dict(checkpoint['D_state_dict'], strict=False)
             else:
                 self.G.load_state_dict(checkpoint['G_state_dict'], strict=False)
                 self.D.load_state_dict(checkpoint['D_state_dict'], strict=False)
-            
+
             # Load optimizer states if available
-            if all(key in checkpoint for key in ['g_optimizer', 'd_optimizer']):
+            if 'g_optimizer' in checkpoint and 'd_optimizer' in checkpoint:
                 self.g_optimizer.load_state_dict(checkpoint['g_optimizer'])
                 self.d_optimizer.load_state_dict(checkpoint['d_optimizer'])
-            
+
             # Load scaler state if available
             if 'scaler' in checkpoint and hasattr(self, 'scaler'):
                 self.scaler.load_state_dict(checkpoint['scaler'])
-            
+
             # Get starting epoch
             start_epoch = checkpoint.get('epoch', 0) + 1
-            
+
             if self.gpu_id == 0:
                 print(f"✓ Successfully loaded checkpoint from epoch {start_epoch-1}")
             return start_epoch
-            
+
         except Exception as e:
             if self.gpu_id == 0:
                 print(f"\n❌ Error loading checkpoint: {str(e)}")
@@ -370,16 +343,15 @@ class AttGANTrainer:
     def train(self):
         """Main training loop with specific error handling"""
         try:
-            start_epoch = self.load_checkpoint(self.config['resume_from']) if self.config['resume_from'] else 0
-            
-            for epoch in range(start_epoch, self.config['epochs']):
+            for epoch in range(self.start_epoch, self.config['epochs']):
                 if self.gpu_id == 0:
                     print(f"\nEpoch {epoch}/{self.config['epochs']}")
-                
+                self.train_loader.sampler.set_epoch(epoch) if self.config['world_size'] > 1 else None
+
                 try:
                     # Training epoch
                     self.train_epoch(epoch)
-                    
+
                     # Validation step
                     if epoch % self.config['val_frequency'] == 0:
                         should_stop = self.validate(epoch)
@@ -387,17 +359,17 @@ class AttGANTrainer:
                             if self.gpu_id == 0:
                                 print("Early stopping criterion met")
                             break
-                    
+
                     # Save checkpoint
                     if epoch % self.config['save_frequency'] == 0:
                         self.save_checkpoint(epoch)
-                        
+
                 except torch.cuda.OutOfMemoryError as e:
                     self.handle_oom_error(epoch, str(e))
                     if self.config['save_on_error']:
                         self.save_checkpoint(epoch, filename='oom_error.pth')
                     continue
-                    
+
                 except RuntimeError as e:
                     if "out of memory" in str(e):
                         self.handle_oom_error(epoch, str(e))
@@ -406,13 +378,13 @@ class AttGANTrainer:
                         continue
                     else:
                         raise  # Re-raise other RuntimeErrors
-                        
+
                 except KeyboardInterrupt:
                     if self.gpu_id == 0:
                         print("\nTraining interrupted by user")
                         self.save_checkpoint(epoch, filename='interrupt.pth')
                     return
-                    
+
         except Exception as e:
             if self.gpu_id == 0:
                 print(f"\nCritical training error: {str(e)}")
@@ -421,118 +393,55 @@ class AttGANTrainer:
                     self.save_checkpoint(epoch, filename='critical_error.pth')
             raise  # Re-raise the exception for proper debugging
 
-    def log_critical_error(self, error):
-        """Log critical errors with detailed information"""
-        if self.gpu_id == 0:
-            error_info = {
-                'timestamp': datetime.datetime.now().isoformat(),
-                'error_type': type(error).__name__,
-                'error_message': str(error),
-                'device': str(self.device),
-                'memory_allocated': f"{torch.cuda.memory_allocated(self.device)/1024**3:.2f}GB",
-                'max_memory': f"{torch.cuda.max_memory_allocated(self.device)/1024**3:.2f}GB",
-                'traceback': traceback.format_exc()
-            }
-            
-            # Log to file
-            error_log_path = os.path.join(self.config['log_dir'], 'critical_errors.json')
-            with open(error_log_path, 'a') as f:
-                json.dump(error_info, f)
-                f.write('\n')
-            
-            # Log to tensorboard
-            if hasattr(self, 'writer'):
-                self.writer.add_text('critical_error', str(error_info))
-
-    def handle_oom_error(self, epoch, error_msg):
-        """Handle out of memory errors with recovery attempts"""
-        if self.gpu_id == 0:
-            print(f"\nOOM error in epoch {epoch}: {error_msg}")
-            print("Attempting recovery...")
-        
-        # Clear memory
-        torch.cuda.empty_cache()
-        
-        # Log memory stats
-        if self.gpu_id == 0:
-            memory_stats = {
-                'allocated': torch.cuda.memory_allocated(self.device)/1024**3,
-                'cached': torch.cuda.memory_reserved(self.device)/1024**3,
-                'max_allocated': torch.cuda.max_memory_allocated(self.device)/1024**3
-            }
-            
-            print("\nMemory Stats (GB):")
-            for key, value in memory_stats.items():
-                print(f"  {key}: {value:.2f}")
-            
-            if hasattr(self, 'writer'):
-                for key, value in memory_stats.items():
-                    self.writer.add_scalar(f'memory/{key}', value, self.global_step)
-
-    def process_large_image(self, image):
-        """Process large images with consistent device handling"""
-        B, C, H, W = image.shape
-        chunk_size = self.config['process_chunk_size']
-        
-        # Ensure input is on correct device
-        image = image.to(self.device, non_blocking=True)
-        output = torch.zeros_like(image, device=self.device)
-        
-        for h in range(0, H, chunk_size):
-            for w in range(0, W, chunk_size):
-                h_end = min(h + chunk_size, H)
-                w_end = min(w + chunk_size, W)
-                chunk = image[:, :, h:h_end, w:w_end]
-                
-                with torch.cuda.amp.autocast(enabled=self.config['use_amp']):
-                    output[:, :, h:h_end, w:w_end] = self.G(chunk)
-        
-        return output
-
     def train_epoch(self, epoch):
         """Training epoch with controlled sample saving"""
         self.G.train()
         self.D.train()
-        
+
         # Save samples only at specified intervals
         should_save_samples = (
             epoch % self.config['sample_frequency'] == 0 or
             epoch < self.config['initial_sample_epochs'] or
             epoch >= self.config['epochs'] - self.config['final_sample_epochs']
         )
-        
+
         # Initialize progress bar
-        if self.gpu_id == 0:
+        if self.gpu_id == 0 and self.config['use_tqdm']:
             pbar = tqdm(
                 total=len(self.train_loader),
                 desc=f'Epoch {epoch}/{self.config["epochs"]}',
                 leave=True
             )
-        
-        # Training loop with sample management
+
+        # Training loop
         for batch_idx, (real_A, real_B) in enumerate(self.train_loader):
             try:
                 # Training step
                 g_loss, d_loss = self.training_step(real_A, real_B)
-                
+
                 # Save samples if needed
                 if should_save_samples and batch_idx == 0:
                     self.save_samples(epoch, real_A, real_B)
-                
+
                 # Update progress
-                if self.gpu_id == 0:
-                    pbar.update(1)
+                if self.gpu_id == 0 and self.config['use_tqdm']:
                     if batch_idx % self.config['log_frequency'] == 0:
                         pbar.set_postfix({
                             'G_loss': f'{g_loss:.4f}',
                             'D_loss': f'{d_loss:.4f}'
                         })
-                    
+                    pbar.update(1)
+
+                self.global_step += 1
+
             except RuntimeError as e:
                 if "out of memory" in str(e):
                     self.handle_oom_error(batch_idx, e)
                     continue
                 raise
+
+        if self.gpu_id == 0 and self.config['use_tqdm']:
+            pbar.close()
 
     def training_step(self, real_A, real_B):
         """Training step with gradient clipping"""
@@ -540,184 +449,225 @@ class AttGANTrainer:
             # Ensure inputs are on correct device
             real_A = real_A.to(self.device, non_blocking=True)
             real_B = real_B.to(self.device, non_blocking=True)
-            
+
             # Reset gradients
-            self.g_optimizer.zero_grad()
-            self.d_optimizer.zero_grad()
-            
-            for acc_step in range(self.config['gradient_accumulation_steps']):
-                with torch.cuda.amp.autocast(enabled=self.config['use_amp']):
-                    # Generate fake images
-                    fake_B = self.G(real_A)
-                    
-                    # Train Discriminator
-                    d_loss = self.train_discriminator(real_B, fake_B.detach())
-                    d_loss = d_loss / self.config['gradient_accumulation_steps']
-                    
-                # Discriminator backward pass
-                self.scaler.scale(d_loss).backward()
-                
-                # Clip D gradients
-                if self.config['gradient_clip_value'] > 0:
-                    self.scaler.unscale_(self.d_optimizer)
-                    torch.nn.utils.clip_grad_norm_(
-                        self.D.parameters(),
-                        self.config['gradient_clip_value']
-                    )
-                
-                with torch.cuda.amp.autocast(enabled=self.config['use_amp']):
-                    # Train Generator
-                    fake_B = self.G(real_A)
-                    g_loss = self.train_generator(real_A, real_B, fake_B)
-                    g_loss = g_loss / self.config['gradient_accumulation_steps']
-                
-                # Generator backward pass
-                self.scaler.scale(g_loss).backward()
-                
-                # Clip G gradients
-                if self.config['gradient_clip_value'] > 0:
-                    self.scaler.unscale_(self.g_optimizer)
-                    torch.nn.utils.clip_grad_norm_(
-                        self.G.parameters(),
-                        self.config['gradient_clip_value']
-                    )
-                
-                # Memory management
-                del fake_B
-                torch.cuda.empty_cache()
-            
-            # Update weights with clipped gradients
+            self.g_optimizer.zero_grad(set_to_none=True)
+            self.d_optimizer.zero_grad(set_to_none=True)
+
+            with torch.cuda.amp.autocast(enabled=self.config['use_amp']):
+                # Generate fake images
+                fake_B = self.process_large_image(real_A)
+
+                # Train Discriminator
+                d_loss = self.train_discriminator(real_B, fake_B.detach())
+
+            # Discriminator backward pass
+            self.scaler.scale(d_loss).backward()
+
+            # Clip D gradients
+            if self.config['gradient_clip_value'] > 0 and self.config['clip_discriminator']:
+                self.scaler.unscale_(self.d_optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    self.D.parameters(),
+                    self.config['gradient_clip_value']
+                )
+
+            # Update discriminator weights
             self.scaler.step(self.d_optimizer)
+
+            with torch.cuda.amp.autocast(enabled=self.config['use_amp']):
+                # Train Generator
+                fake_B = self.process_large_image(real_A)
+                g_loss = self.train_generator(real_A, real_B, fake_B)
+
+            # Generator backward pass
+            self.scaler.scale(g_loss).backward()
+
+            # Clip G gradients
+            if self.config['gradient_clip_value'] > 0 and self.config['clip_generator']:
+                self.scaler.unscale_(self.g_optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    self.G.parameters(),
+                    self.config['gradient_clip_value']
+                )
+
+            # Update generator weights
             self.scaler.step(self.g_optimizer)
+
+            # Update scaler
             self.scaler.update()
-            
+
+            # Learning rate scheduler step
+            if self.config['use_lr_scheduler']:
+                self.g_scheduler.step()
+                self.d_scheduler.step()
+
+            # Log progress
+            self.log_progress(g_loss.item(), d_loss.item())
+
             return g_loss.item(), d_loss.item()
-            
+
         except Exception as e:
             self.handle_training_error(e)
             raise
 
-    def should_clear_cache(self, batch_idx):
-        """Memory management with device-specific tracking"""
-        if batch_idx % self.config['empty_cache_frequency'] == 0:
-            current_memory = torch.cuda.memory_allocated(self.device) / 1024**3
-            max_memory = torch.cuda.get_device_properties(self.device).total_memory / 1024**3
-            if current_memory > self.config['memory_threshold'] * max_memory:
-                return True
-        return False
+    def process_large_image(self, image):
+        """Process large images with consistent device handling"""
+        B, C, H, W = image.shape
+        chunk_size = self.config['process_chunk_size']
 
-    def handle_oom_error(self, batch_idx, error):
-        """Device-specific OOM handling"""
-        print(f"\nWARNING: Out of memory on device {self.device} (batch {batch_idx})")
-        print(f"Current memory: {torch.cuda.memory_allocated(self.device)/1024**3:.2f}GB")
-        print(f"Max memory: {torch.cuda.max_memory_allocated(self.device)/1024**3:.2f}GB")
-        
-        torch.cuda.empty_cache()
-        if hasattr(self, 'writer'):
-            self.writer.add_scalar('training/oom_events', 1, self.global_step)
+        # Ensure input is on correct device
+        image = image.to(self.device, non_blocking=True)
+        output = torch.zeros_like(image, device=self.device)
 
-    def handle_training_error(self, batch_idx, error):
-        """Handle other training errors"""
-        print(f"\nERROR on batch {batch_idx}: {str(error)}")
-        print(f"Memory usage at error: {torch.cuda.memory_allocated()/1024**3:.2f}GB")
-        if hasattr(self, 'writer'):
-            self.writer.add_scalar('training/error_events', 1, self.global_step)
+        if H <= chunk_size and W <= chunk_size:
+            # Process entire image at once
+            output = self.G(image)
+        else:
+            for h in range(0, H, chunk_size):
+                for w in range(0, W, chunk_size):
+                    h_end = min(h + chunk_size, H)
+                    w_end = min(w + chunk_size, W)
+                    chunk = image[:, :, h:h_end, w:w_end]
 
-    def log_progress(self, epoch, batch_idx, g_loss, d_loss):
-        """Enhanced progress logging with gradient monitoring"""
-        if self.gpu_id != 0:
-            return
-        
-        if batch_idx % self.config['log_frequency'] == 0:
-            step = epoch * len(self.train_loader) + batch_idx
-            
-            # Calculate gradient norms
-            g_grad_norm = 0.0
-            d_grad_norm = 0.0
-            
-            for p in self.G.parameters():
-                if p.grad is not None:
-                    g_grad_norm += p.grad.data.norm(2).item() ** 2
-            g_grad_norm = g_grad_norm ** 0.5
-            
-            for p in self.D.parameters():
-                if p.grad is not None:
-                    d_grad_norm += p.grad.data.norm(2).item() ** 2
-            d_grad_norm = d_grad_norm ** 0.5
-            
-            # Log metrics
-            metrics = {
-                'Train/G_loss': g_loss,
-                'Train/D_loss': d_loss,
-                'Train/G_grad_norm': g_grad_norm,
-                'Train/D_grad_norm': d_grad_norm,
-                'Train/G_grad_clipped': g_grad_norm > self.config['gradient_clip_value'],
-                'Train/D_grad_clipped': d_grad_norm > self.config['gradient_clip_value']
-            }
-            
-            # Log to tensorboard
-            if hasattr(self, 'writer'):
-                for name, value in metrics.items():
-                    self.writer.add_scalar(name, value, step)
+                    with torch.cuda.amp.autocast(enabled=self.config['use_amp']):
+                        output[:, :, h:h_end, w:w_end] = self.G(chunk)
+
+        return output
+
+    def train_discriminator(self, real_B, fake_B):
+        """Train discriminator with Hinge Loss"""
+        # Real images
+        real_validity = self.D(real_B)
+        d_real_loss = self.adversarial_loss(real_validity, is_real=True)
+
+        # Fake images
+        fake_validity = self.D(fake_B)
+        d_fake_loss = self.adversarial_loss(fake_validity, is_real=False)
+
+        # Total discriminator loss
+        d_loss = (d_real_loss + d_fake_loss) / 2
+        return d_loss
+
+    def train_generator(self, real_A, real_B, fake_B):
+        """Train generator with enhanced identity preservation"""
+        # Reconstruction losses
+        g_rec_loss = self.reconstruction_loss(fake_B, real_B)
+        g_perceptual_loss = self.perceptual_loss(fake_B, real_B)
+
+        # Adversarial loss
+        fake_validity = self.D(fake_B)
+        # **For generator, use adversarial loss as -mean(fake_validity)**
+        g_adv_loss = -torch.mean(fake_validity)
+
+        # Sharpness and TV loss
+        g_sharpness_loss = self.sharpness_loss(fake_B)
+        g_tv_loss = self.tv_loss(fake_B)
+
+        # Face identity loss
+        face_identity_loss = self.compute_face_identity_loss(real_B, fake_B)
+
+        # Combined loss
+        g_loss = (
+            self.config['lambda_adv'] * g_adv_loss +
+            self.config['lambda_rec'] * g_rec_loss +
+            self.config['lambda_perceptual'] * g_perceptual_loss +
+            self.config['lambda_identity'] * face_identity_loss +
+            self.config['lambda_sharpness'] * g_sharpness_loss +
+            self.config['lambda_tv'] * g_tv_loss
+        )
+
+        return g_loss
+
+    def compute_face_identity_loss(self, real_images, fake_images):
+        """Compute identity preservation loss using face recognition"""
+        real_embeddings = self.face_model(real_images)
+        fake_embeddings = self.face_model(fake_images)
+        real_embeddings = F.normalize(real_embeddings, p=2, dim=1)
+        fake_embeddings = F.normalize(fake_embeddings, p=2, dim=1)
+        identity_loss = -F.cosine_similarity(real_embeddings, fake_embeddings).mean()
+        return identity_loss
 
     def validate(self, epoch):
         """Validation with consistent device handling"""
         self.G.eval()
-        metrics = {key: 0.0 for key in self.config['validation']['metric_weights']}
-        
+        metrics = {'val_g_loss': 0.0, 'val_fid': 0.0, 'val_lpips': 0.0, 'val_identity_sim': 0.0}
+        num_batches = 0
+
         try:
             with torch.no_grad():
                 for batch_idx, (real_A, real_B) in enumerate(self.val_loader):
-                    # Move data to device efficiently
                     real_A = real_A.to(self.device, non_blocking=True)
                     real_B = real_B.to(self.device, non_blocking=True)
-                    
-                    # Generate fake images
+
                     fake_B = self.process_large_image(real_A)
-                    
-                    # Compute metrics on device
-                    metrics = self.compute_validation_metrics(
-                        real_A, real_B, fake_B, metrics
-                    )
-                    
+
+                    # Compute validation losses
+                    g_loss = self.reconstruction_loss(fake_B, real_B)
+                    metrics['val_g_loss'] += g_loss.item()
+
+                    # Compute FID
+                    if batch_idx % self.config['validation']['fid_frequency'] == 0:
+                        self.fid.update(real_B, real=True)
+                        self.fid.update(fake_B, real=False)
+
+                    # Compute LPIPS
+                    lpips_distance = self.lpips_loss(real_B, fake_B).mean()
+                    metrics['val_lpips'] += lpips_distance.item()
+
+                    # Compute identity similarity
+                    identity_similarity = self.compute_identity_similarity(real_B, fake_B)
+                    metrics['val_identity_sim'] += identity_similarity
+
+                    num_batches += 1
+
                     # Save validation images from main process
                     if batch_idx == 0 and self.gpu_id == 0:
                         self.save_validation_images(epoch, real_A, fake_B, real_B)
-                    
+
+                # Finalize metrics
+                metrics['val_g_loss'] /= num_batches
+                metrics['val_lpips'] /= num_batches
+                metrics['val_identity_sim'] /= num_batches
+
+                # Compute FID
+                metrics['val_fid'] = self.fid.compute().item()
+                self.fid.reset()
+
+                # Log validation metrics
+                self.log_validation_metrics(epoch, metrics)
+
+                # Early stopping check
+                should_stop = self.early_stopping_check(epoch, metrics)
+                return should_stop
+
         except Exception as e:
             self.handle_validation_error(e)
             return False
-        
-        return self.process_validation_results(epoch, metrics)
+
+    def compute_identity_similarity(self, real_images, fake_images):
+        """Compute cosine similarity between face embeddings"""
+        real_embeddings = self.face_model(real_images)
+        fake_embeddings = self.face_model(fake_images)
+        real_embeddings = F.normalize(real_embeddings, p=2, dim=1)
+        fake_embeddings = F.normalize(fake_embeddings, p=2, dim=1)
+        similarity = F.cosine_similarity(real_embeddings, fake_embeddings).mean().item()
+        return similarity
 
     def early_stopping_check(self, epoch, metrics):
         """Enhanced early stopping with multiple metrics"""
-        improved = False
-        
-        # Define weights for different metrics in early stopping decision
-        metric_weights = {
-            'val_g_loss': 0.3,
-            'val_fid': 0.3,
-            'val_lpips': 0.2,
-            'val_identity_sim': 0.2
-        }
-        
-        # Calculate weighted score
+        metric_weights = self.config['validation']['metric_weights']
         current_score = (
             metric_weights['val_g_loss'] * metrics['val_g_loss'] +
             metric_weights['val_fid'] * metrics['val_fid'] +
-            metric_weights['val_lpips'] * metrics['val_lpips'] -  # Note: negative because higher is better
-            metric_weights['val_identity_sim'] * metrics['val_identity_sim']  # Note: negative because higher is better
+            metric_weights['val_lpips'] * metrics['val_lpips'] -
+            metric_weights['val_identity_sim'] * metrics['val_identity_sim']
         )
-        
-        if not hasattr(self, 'best_score'):
-            self.best_score = float('inf')
-        
+
         if current_score < self.best_score:
             self.best_score = current_score
-            improved = True
             self.patience_counter = 0
-            
+
             # Save best model
             if self.gpu_id == 0:
                 self.save_checkpoint(epoch, is_best=True)
@@ -731,45 +681,33 @@ class AttGANTrainer:
                 print(f"\nNo improvement for {self.patience_counter} epochs")
                 print(f"Current score: {current_score:.4f}")
                 print(f"Best score: {self.best_score:.4f}")
-        
+
         # Check early stopping condition
         if self.patience_counter >= self.config['early_stopping_patience']:
             if self.gpu_id == 0:
                 print(f"\nEarly stopping triggered after {epoch} epochs!")
                 print(f"Best validation score: {self.best_score:.4f}")
             return True
-        
+
         return False
 
-    def log_validation_metrics(self, epoch, metrics):
-        """Enhanced validation metrics logging"""
-        stats = {
-            'epoch': epoch,
-            'timestamp': datetime.datetime.now().isoformat(),
-            **metrics,
-            'best_score': getattr(self, 'best_score', float('inf')),
-            'patience_counter': self.patience_counter
-        }
-        
-        # Save to CSV
-        df = pd.DataFrame([stats])
-        log_file = os.path.join(self.config['log_dir'], 'validation_metrics.csv')
-        df.to_csv(log_file, mode='a', header=not os.path.exists(log_file))
-        
-        # Print current status
-        print(f"\nValidation Metrics (Epoch {epoch}):")
-        for key, value in metrics.items():
-            print(f"  {key}: {value:.4f}")
+    def log_progress(self, g_loss, d_loss):
+        """Enhanced progress logging"""
+        if self.gpu_id == 0 and hasattr(self, 'writer'):
+            self.writer.add_scalar('Train/G_loss', g_loss, self.global_step)
+            self.writer.add_scalar('Train/D_loss', d_loss, self.global_step)
 
-    def save_checkpoint(self, epoch, is_best=False):
+    def save_checkpoint(self, epoch, is_best=False, filename=None):
         """Save checkpoint with proper error handling and cleanup"""
         try:
             checkpoint_dir = self.config['checkpoint_dir']
-            checkpoint_path = os.path.join(
-                checkpoint_dir, 
-                f'checkpoint_epoch_{epoch}.pth'
-            )
-            
+            if filename is None:
+                checkpoint_path = os.path.join(
+                    checkpoint_dir, f'checkpoint_epoch_{epoch}.pth'
+                )
+            else:
+                checkpoint_path = os.path.join(checkpoint_dir, filename)
+
             # Prepare checkpoint data
             checkpoint = {
                 'epoch': epoch,
@@ -781,446 +719,167 @@ class AttGANTrainer:
                 'scaler': self.scaler.state_dict(),
                 'timestamp': datetime.datetime.now().isoformat()
             }
-            
-            # Save checkpoint with safe atomic write
-            self.safe_save_checkpoint(checkpoint_path, checkpoint)
-            
+
+            # Save checkpoint
+            torch.save(checkpoint, checkpoint_path)
+
             # Save best model if needed
             if is_best:
                 best_path = os.path.join(checkpoint_dir, 'best_model.pth')
-                self.safe_save_checkpoint(best_path, checkpoint)
-                if self.gpu_id == 0:
-                    print(f"✓ Saved new best model")
-            
-            # Save latest for easy resume
-            latest_path = os.path.join(checkpoint_dir, 'latest.pth')
-            self.safe_save_checkpoint(latest_path, checkpoint)
-            
-            # Cleanup old checkpoints
-            self.cleanup_old_checkpoints(self.config['keep_last_checkpoints'])
-            
-            # Log checkpoint info
+                torch.save(checkpoint, best_path)
+
             if self.gpu_id == 0:
                 print(f"✓ Checkpoint saved: {checkpoint_path}")
-                self.log_checkpoint_info(epoch, checkpoint_path, is_best)
-            
+
         except Exception as e:
             if self.gpu_id == 0:
                 print(f"❌ Error saving checkpoint: {str(e)}")
-                self.log_error("checkpoint_save_error", str(e))
 
-    def safe_save_checkpoint(self, path, checkpoint):
-        """Save checkpoint with atomic write operation"""
-        temp_path = path + '.tmp'
-        try:
-            # Save to temporary file first
-            torch.save(checkpoint, temp_path)
-            # Atomic rename operation
-            os.replace(temp_path, path)
-        except Exception as e:
-            # Clean up temp file if it exists
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
-            raise e
+    def denormalize(self, tensor):
+        """Denormalize tensor using mean and std from config"""
+        mean = torch.tensor(self.config['normalization_mean']).view(-1, 1, 1).to(tensor.device)
+        std = torch.tensor(self.config['normalization_std']).view(-1, 1, 1).to(tensor.device)
+        return tensor * std + mean
 
-    def cleanup_old_checkpoints(self, keep_last):
-        """Enhanced checkpoint cleanup with better error handling"""
-        if self.gpu_id != 0:  # Only run on main process
+    def save_samples(self, epoch, real_A, real_B):
+        """Save sample images"""
+        if self.gpu_id != 0:
             return
-        
-        try:
-            checkpoint_dir = self.config['checkpoint_dir']
-            if not os.path.exists(checkpoint_dir):
-                return
-            
-            # Get list of regular checkpoints (excluding best and latest)
-            checkpoints = sorted([
-                f for f in os.listdir(checkpoint_dir)
-                if f.startswith('checkpoint_epoch_') and f.endswith('.pth')
-            ], key=lambda x: int(x.split('_')[2].split('.')[0]))
-            
-            # Keep the specified number of most recent checkpoints
-            if len(checkpoints) > keep_last:
-                for checkpoint in checkpoints[:-keep_last]:
-                    checkpoint_path = os.path.join(checkpoint_dir, checkpoint)
-                    try:
-                        if os.path.exists(checkpoint_path):
-                            os.remove(checkpoint_path)
-                            if self.config['detailed_logging']['system_metrics']:
-                                print(f"Removed old checkpoint: {checkpoint}")
-                    except OSError as e:
-                        print(f"Warning: Could not remove checkpoint {checkpoint}: {e}")
-                        self.log_error("checkpoint_cleanup_error", str(e))
-            
-            # Log cleanup results
-            if hasattr(self, 'writer'):
-                self.writer.add_scalar(
-                    'system/checkpoints_kept',
-                    len(checkpoints[-keep_last:]),
-                    self.global_step
-                )
-                
-        except Exception as e:
-            print(f"Warning: Error during checkpoint cleanup: {e}")
-            self.log_error("checkpoint_cleanup_error", str(e))
 
-    def log_checkpoint_info(self, epoch, path, is_best):
-        """Log checkpoint information to CSV and tensorboard"""
-        if not hasattr(self, 'checkpoint_log'):
-            self.checkpoint_log = []
-        
-        info = {
-            'epoch': epoch,
-            'path': path,
-            'is_best': is_best,
-            'timestamp': datetime.datetime.now().isoformat(),
-            'size_mb': os.path.getsize(path) / (1024 * 1024)
-        }
-        
-        self.checkpoint_log.append(info)
-        
-        # Save to CSV
-        if self.config['log_to_file']:
-            df = pd.DataFrame([info])
-            log_path = os.path.join(self.config['log_dir'], 'checkpoint_log.csv')
-            df.to_csv(log_path, mode='a', header=not os.path.exists(log_path))
-        
-        # Log to tensorboard
-        if hasattr(self, 'writer'):
-            self.writer.add_scalar('system/checkpoint_size_mb', info['size_mb'], epoch)
+        try:
+            sample_dir = self.config['sample_dir']
+            os.makedirs(sample_dir, exist_ok=True)
+
+            with torch.no_grad():
+                fake_B = self.process_large_image(real_A)
+
+            # Move tensors to CPU
+            real_A_cpu = real_A.detach().cpu()
+            fake_B_cpu = fake_B.detach().cpu()
+            real_B_cpu = real_B.detach().cpu()
+
+            # Denormalize images
+            real_A_cpu = self.denormalize(real_A_cpu)
+            fake_B_cpu = self.denormalize(fake_B_cpu)
+            real_B_cpu = self.denormalize(real_B_cpu)
+
+            # Concatenate images
+            img_sample = torch.cat((real_A_cpu, fake_B_cpu, real_B_cpu), dim=0)
+
+            save_path = os.path.join(sample_dir, f'epoch_{epoch}.png')
+            save_image(img_sample, save_path, nrow=real_A_cpu.size(0), normalize=False)
+
+            # Log images to TensorBoard
+            if hasattr(self, 'writer'):
+                grid = torchvision.utils.make_grid(img_sample, nrow=real_A_cpu.size(0))
+                self.writer.add_image('Samples', grid, epoch)
+
+        except Exception as e:
+            print(f"Error saving samples: {str(e)}")
 
     def save_validation_images(self, epoch, real_A, fake_B, real_B):
         """Save sample validation images"""
-        # Denormalize images from [-1, 1] to [0, 1]
-        real_A = (real_A + 1.0) * 0.5
-        fake_B = (fake_B + 1.0) * 0.5
-        real_B = (real_B + 1.0) * 0.5
-        
-        # Make a grid of images
-        img_sample = torch.cat((real_A.data, fake_B.data, real_B.data), -2)
-        
-        # Create filename
-        save_path = os.path.join(
-            self.config['sample_dir'], 
-            f'epoch_{epoch}.png'
-        )
-        
-        # Save image grid
-        save_image(
-            img_sample, 
-            save_path,
-            nrow=self.config['batch_size'],
-            normalize=False,  # Already normalized
-            value_range=(0, 1)
-        )
-        
-        # Log images to tensorboard if enabled
-        if hasattr(self, 'writer'):
-            self.writer.add_image(
-                'Validation/real_A_fake_B_real_B', 
-                img_sample[0],
-                epoch,
-                dataformats='CHW'
-            )
+        if self.gpu_id != 0:
+            return
 
-    def log_to_csv(self, epoch, g_loss, d_loss):
+        try:
+            # Move tensors to CPU
+            real_A_cpu = real_A.detach().cpu()
+            fake_B_cpu = fake_B.detach().cpu()
+            real_B_cpu = real_B.detach().cpu()
+
+            # Denormalize images
+            real_A_cpu = self.denormalize(real_A_cpu)
+            fake_B_cpu = self.denormalize(fake_B_cpu)
+            real_B_cpu = self.denormalize(real_B_cpu)
+
+            # Concatenate images
+            img_sample = torch.cat((real_A_cpu, fake_B_cpu, real_B_cpu), dim=0)
+
+            save_path = os.path.join(self.config['sample_dir'], f'validation_epoch_{epoch}.png')
+            save_image(img_sample, save_path, nrow=real_A_cpu.size(0), normalize=False)
+
+            # Log images to TensorBoard
+            if hasattr(self, 'writer'):
+                grid = torchvision.utils.make_grid(img_sample, nrow=real_A_cpu.size(0))
+                self.writer.add_image('Validation/Samples', grid, epoch)
+
+        except Exception as e:
+            print(f"Error saving validation images: {str(e)}")
+
+    def log_validation_metrics(self, epoch, metrics):
+        """Enhanced validation metrics logging"""
         stats = {
             'epoch': epoch,
-            'g_loss': g_loss.item(),
-            'd_loss': d_loss.item(),
-            'timestamp': time.time()
+            'timestamp': datetime.datetime.now().isoformat(),
+            **metrics,
+            'best_score': self.best_score,
+            'patience_counter': self.patience_counter
         }
-        
+
+        # Save to CSV
         df = pd.DataFrame([stats])
-        df.to_csv('training_log.csv', mode='a', header=not os.path.exists('training_log.csv'))
+        log_file = os.path.join(self.config['log_dir'], 'validation_metrics.csv')
+        df.to_csv(log_file, mode='a', header=not os.path.exists(log_file), index=False)
 
-    def denormalize(self, x):
-        """Denormalize from [-1, 1] to [0, 1]"""
-        return (x + 1) / 2
+        # Log to TensorBoard
+        if hasattr(self, 'writer'):
+            for key, value in metrics.items():
+                self.writer.add_scalar(f'Validation/{key}', value, epoch)
 
-    def compute_fid_score(self, real_images, fake_images):
-        """Compute FID score between real and generated images"""
-        if not self.use_fid:
-            return 0.0  # Return dummy value if FID calculation is disabled
-        
-        self.fid.update(real_images, real=True)
-        self.fid.update(fake_images, real=False)
-        fid_score = self.fid.compute()
-        self.fid.reset()
-        return fid_score
-
-    def compute_identity_similarity(self, real_images, fake_images):
-        """Compute cosine similarity between face embeddings"""
-        with torch.no_grad():
-            # Get face embeddings
-            real_embeddings = self.face_model(real_images)
-            fake_embeddings = self.face_model(fake_images)
-            
-            # Normalize embeddings
-            real_embeddings = F.normalize(real_embeddings, p=2, dim=1)
-            fake_embeddings = F.normalize(fake_embeddings, p=2, dim=1)
-            
-            # Compute cosine similarity
-            similarity = F.cosine_similarity(real_embeddings, fake_embeddings)
-            
-            return similarity.mean().item()
-
-    def compute_lpips_distance(self, real_images, fake_images):
-        """Compute LPIPS perceptual distance"""
-        with torch.no_grad():
-            distance = self.lpips_loss(real_images, fake_images)
-            return distance.mean().item()
-
-    def train_discriminator(self, real_B, fake_B):
-        """Train discriminator"""
-        # Real images
-        real_validity = self.D(real_B)
-        real_labels = torch.ones_like(real_validity).to(self.device)
-        d_real_loss = self.adversarial_loss(real_validity, real_labels)
-        
-        # Fake images - already detached from generator
-        fake_validity = self.D(fake_B)
-        fake_labels = torch.zeros_like(fake_validity).to(self.device)
-        d_fake_loss = self.adversarial_loss(fake_validity, fake_labels)
-        
-        # Total discriminator loss
-        d_loss = (d_real_loss + d_fake_loss) / 2
-        return d_loss
-
-    def train_generator(self, real_A, real_B, fake_B):
-        """Train generator with enhanced identity preservation"""
-        # Basic reconstruction losses
-        g_rec_loss = self.reconstruction_loss(fake_B, real_B)
-        g_perceptual_loss = self.perceptual_loss(fake_B, real_B)
-        
-        # Face recognition losses
-        face_identity_loss = self.compute_face_identity_loss(real_B, fake_B)
-        face_alignment_loss = self.compute_face_alignment_loss(real_B, fake_B)
-        
-        # Adversarial and texture losses
-        fake_validity = self.D(fake_B)
-        real_labels = torch.ones_like(fake_validity).to(self.device)
-        g_adv_loss = self.adversarial_loss(fake_validity, real_labels)
-        g_sharpness_loss = self.sharpness_loss(fake_B)
-        g_tv_loss = self.tv_loss(fake_B)
-        
-        # Combined loss with face recognition components
-        g_loss = (
-            self.config['lambda_adv'] * g_adv_loss +
-            self.config['lambda_rec'] * g_rec_loss +
-            self.config['lambda_perceptual'] * g_perceptual_loss +
-            self.config['lambda_identity'] * face_identity_loss +
-            self.config['lambda_face_alignment'] * face_alignment_loss +
-            self.config['lambda_sharpness'] * g_sharpness_loss +
-            self.config['lambda_tv'] * g_tv_loss
-        )
-        
-        return g_loss
-
-    def compute_face_identity_loss(self, real_images, fake_images):
-        """Compute identity preservation loss using face recognition"""
-        with torch.no_grad():
-            # Get face embeddings
-            real_embeddings = self.face_model(real_images)
-            fake_embeddings = self.face_model(fake_images)
-            
-            # Normalize embeddings
-            real_embeddings = F.normalize(real_embeddings, p=2, dim=1)
-            fake_embeddings = F.normalize(fake_embeddings, p=2, dim=1)
-            
-            # Identity loss is negative cosine similarity
-            identity_loss = -F.cosine_similarity(
-                real_embeddings, 
-                fake_embeddings, 
-                dim=1
-            ).mean()
-            
-            return identity_loss
-
-    def compute_face_alignment_loss(self, real_images, fake_images):
-        """Compute face alignment loss using MTCNN landmarks"""
-        try:
-            # Detect facial landmarks
-            real_landmarks = self.mtcnn.detect_landmarks(real_images)
-            fake_landmarks = self.mtcnn.detect_landmarks(fake_images)
-            
-            if real_landmarks is None or fake_landmarks is None:
-                return torch.tensor(0.0).to(self.device)
-            
-            # Convert landmarks to tensors
-            real_landmarks = torch.tensor(real_landmarks).to(self.device)
-            fake_landmarks = torch.tensor(fake_landmarks).to(self.device)
-            
-            # Compute MSE between landmark positions
-            alignment_loss = F.mse_loss(real_landmarks, fake_landmarks)
-            
-            return alignment_loss
-            
-        except Exception as e:
-            if self.gpu_id == 0:
-                print(f"Warning: Face alignment computation failed: {str(e)}")
-            return torch.tensor(0.0).to(self.device)
-
-    def calculate_logging_frequency(self):
-        """Calculate optimal logging frequency based on dataset size"""
-        dataset_size = len(self.train_loader.dataset)
-        batches_per_epoch = dataset_size // (self.config['batch_size'] * self.config['world_size'])
-        
-        # Aim for roughly 10-20 log entries per epoch
-        suggested_frequency = max(1, batches_per_epoch // 15)
-        
-        # Update config with calculated frequency
+    def handle_oom_error(self, identifier, error_msg):
+        """Handle out of memory errors with recovery attempts"""
         if self.gpu_id == 0:
-            print(f"\nDataset size: {dataset_size}")
-            print(f"Batches per epoch: {batches_per_epoch}")
-            print(f"Suggested logging frequency: {suggested_frequency}")
-            
-        self.config['log_frequency'] = suggested_frequency
+            print(f"\nOOM error at {identifier}: {error_msg}")
+            print("Attempting recovery...")
 
-    def save_samples(self, epoch, real_A, real_B, max_samples=8):
-        """Save sample images with space management"""
-        if self.gpu_id != 0:  # Only save on main process
-            return
-        
-        try:
-            sample_dir = self.config['sample_dir']
-            
-            # Create epoch-specific directory
-            epoch_dir = os.path.join(sample_dir, f'epoch_{epoch}')
-            os.makedirs(epoch_dir, exist_ok=True)
-            
-            # Generate fake images
-            with torch.no_grad():
-                fake_B = self.G(real_A[:max_samples])
-            
-            # Save comparison grid
-            comparison = self.create_comparison_grid(
-                real_A[:max_samples],
-                fake_B,
-                real_B[:max_samples]
-            )
-            
-            # Save with compression
-            save_image(
-                comparison,
-                os.path.join(epoch_dir, f'comparison.jpg'),
-                nrow=max_samples,
-                normalize=True,
-                quality=90  # JPEG quality
-            )
-            
-            # Cleanup old sample directories if needed
-            self.cleanup_old_samples()
-            
-        except Exception as e:
-            print(f"Error saving samples: {str(e)}")
-            self.log_error("sample_save_error", str(e))
+        torch.cuda.empty_cache()
 
-    def cleanup_old_samples(self):
-        """Manage sample directory size"""
-        try:
-            sample_dir = self.config['sample_dir']
-            if not os.path.exists(sample_dir):
-                return
-            
-            # Get list of epoch directories
-            epoch_dirs = sorted([
-                d for d in os.listdir(sample_dir)
-                if d.startswith('epoch_')
-            ], key=lambda x: int(x.split('_')[1]))
-            
-            # Keep only specified number of sample directories
-            if len(epoch_dirs) > self.config['keep_last_samples']:
-                # Always keep first and last epoch samples
-                dirs_to_remove = epoch_dirs[1:-1][:-self.config['keep_last_samples']]
-                
-                for dir_name in dirs_to_remove:
-                    dir_path = os.path.join(sample_dir, dir_name)
-                    try:
-                        shutil.rmtree(dir_path)
-                    except OSError as e:
-                        print(f"Warning: Could not remove sample directory {dir_name}: {e}")
-                    
-        except Exception as e:
-            print(f"Warning: Error during sample cleanup: {e}")
+    def handle_training_error(self, error):
+        """Handle training errors"""
+        if self.gpu_id == 0:
+            print(f"\nTraining error: {str(error)}")
 
-    def monitor_dataloader_performance(self):
-        """Monitor and log DataLoader performance metrics"""
-        if not self.config['monitor_loading']['track_loading_time']:
-            return
-        
-        # Measure loading time for one epoch
-        start_time = time.time()
-        data_loading_times = []
-        
-        for batch_idx, (real_A, real_B) in enumerate(self.train_loader):
-            batch_time = time.time() - start_time
-            data_loading_times.append(batch_time)
-            start_time = time.time()
-            
-            # Log statistics periodically
-            if batch_idx % self.config['monitor_loading']['loading_stats_frequency'] == 0:
-                avg_time = np.mean(data_loading_times)
-                if self.gpu_id == 0:
-                    print(f"\nDataLoader Performance:")
-                    print(f"  Average batch loading time: {avg_time:.3f}s")
-                    print(f"  Batches per second: {1.0/avg_time:.2f}")
-                    
-                    if hasattr(self, 'writer'):
-                        self.writer.add_scalar(
-                            'performance/data_loading_time',
-                            avg_time,
-                            self.global_step
-                        )
-                    
-                    # Warning for slow loading
-                    if (self.config['monitor_loading']['warn_slow_loading'] and 
-                        avg_time > 0.1 * self.config['batch_size']):
-                        print("\nWarning: Data loading might be a bottleneck")
-                        print("Consider increasing num_workers or prefetch_factor")
+    def handle_validation_error(self, error):
+        """Handle validation errors"""
+        if self.gpu_id == 0:
+            print(f"\nValidation error: {str(error)}")
 
-def setup(rank, world_size, config):
-        # Set environment variables for master address and port
-    os.environ['MASTER_ADDR'] = '127.0.0.1'
-    os.environ['MASTER_PORT'] = '12356'
+    def log_critical_error(self, error):
+        """Log critical errors with detailed information"""
+        if self.gpu_id == 0:
+            error_info = {
+                'timestamp': datetime.datetime.now().isoformat(),
+                'error_type': type(error).__name__,
+                'error_message': str(error),
+                'device': str(self.device),
+                'memory_allocated': f"{torch.cuda.memory_allocated(self.device)/1024**3:.2f}GB",
+                'max_memory': f"{torch.cuda.max_memory_allocated(self.device)/1024**3:.2f}GB",
+                'traceback': traceback.format_exc()
+            }
 
-    # Initialize process group without init_method
-    dist.init_process_group(
-        backend='nccl',
-        world_size=world_size,
-        rank=rank
-    )
-    
-    # Set device for this process
-    torch.cuda.set_device(rank)
+            error_log_path = os.path.join(self.config['log_dir'], 'critical_errors.json')
+            with open(error_log_path, 'a') as f:
+                json.dump(error_info, f)
+                f.write('\n')
 
-def get_linear_warmup_scheduler(optimizer, warmup_epochs, total_epochs):
-    def lr_lambda(current_epoch):
-        if current_epoch < warmup_epochs:
-            return float(current_epoch) / float(max(1, warmup_epochs))
-        return 1.0
-    return LambdaLR(optimizer, lr_lambda)
-
-def cleanup():
-    dist.destroy_process_group()
+            if hasattr(self, 'writer'):
+                self.writer.add_text('critical_error', str(error_info))
 
 def main(rank, world_size, config):
     try:
         # Update config with process-specific info
         config['rank'] = rank
         config['world_size'] = world_size
-        
-        # Set up error handling for CUDA devices
-        torch.cuda.set_device(rank)
-        
-        setup(rank, world_size, config)
-        
+
+        setup(rank, world_size)
+
         # Create trainer instance
         trainer = AttGANTrainer(config, rank)
-        
+
         # Train model
         trainer.train()
-        
+
     except Exception as e:
         print(f"Error in rank {rank}: {str(e)}")
         raise e
@@ -1236,179 +895,96 @@ if __name__ == "__main__":
         'checkpoint_dir': 'checkpoints',
         'sample_dir': 'samples',
         'log_dir': 'logs',
-        
-        # Training parameters - Adjusted for high resolution
-        'batch_size': 1,                     # Reduced batch size
-        'num_workers': 1,                    # Minimal workers
-        'lr': 0.00001,            # Keep low learning rate for stability
+
+        # Training parameters
+        'batch_size': 2,          # Increased batch size
+        'num_workers': 4,
+        'lr': 1e-5,  # Reduce from 1e-4 to 1e-5
         'beta1': 0.5,
         'beta2': 0.999,
         'epochs': 200,
-        
-        # Model parameters - Tuned for high resolution
-        'image_size': 1024,        # Change from 1024 to 512
-        'lambda_adv': 1.0,        # Reduced adversarial weight
-        'lambda_rec': 10.0,         # High reconstruction weight
-        'lambda_perceptual': 5.0,  # Strong perceptual loss
-        'lambda_identity': 2.0,    # Strong identity preservation
-        'lambda_sharpness': 0.5,    # Moderate sharpness
-        'lambda_tv': 0.1,          # Low TV loss
-        
-        # Memory optimization - Critical for 1024x1024
-        'use_amp': True,           # Keep AMP enabled
-        'gradient_accumulation_steps': 16,    # Increased accumulation
-        'batch_chunk_size': 256,             # Process in smaller chunks
-        'process_chunk_size': 512,           # Chunk size for processing
-        
+
+        # Model parameters
+        'image_size': 512,        # Reduced image size
+        'lambda_adv': 2.0,          # Increase from 1.0 to 2.0
+        'lambda_rec': 50.0,         # Keep the same or adjust slightly
+        'lambda_perceptual': 10.0,  # Increase from 5.0 to 10.0
+        'lambda_identity': 5.0,     # Increase from 2.0 to 5.0
+        'lambda_sharpness': 2.0,    # Increase from 1.0 to 2.0
+        'lambda_tv': 0.0,           # Keep as is unless you want to penalize total variation
+
+        # Memory optimization
+        'use_amp': True,
+        'gradient_accumulation_steps': 1,  # No accumulation needed with increased batch size
+        'process_chunk_size': 512,         # Can process the whole image at once
+
         # Training schedule
         'val_frequency': 1,
-        'save_frequency': 2,       # More frequent saving
-        'log_frequency': None,       # Reduced logging frequency
-        
+        'save_frequency': 5,
+
         # Distributed training
-        'dist_url': 'tcp://127.0.0.1:12356',
-        'dist_backend': 'nccl',
-        'multiprocessing_distributed': True,
-        'pin_memory': True,
-        'prefetch_factor': 1,                # Minimal prefetch
-        
+        'world_size': torch.cuda.device_count(),
+
         # Learning rate scheduling
         'use_lr_scheduler': True,
-        'lr_scheduler_patience': 8,
-        'lr_scheduler_factor': 0.5,
-        
+        'lr_scheduler_type': 'StepLR',
+        'lr_step_size': 30,   # Decrease LR every 30 epochs
+        'lr_gamma': 0.5,      # Reduce LR by half
+        'warmup_epochs': 5,
+
         # Checkpoint handling
         'resume_from_checkpoint': None,
-        'keep_last_checkpoints': 3,  # Reduced due to larger file sizes
-        'save_best_model': True,
-        
-        # Training stability
-        'gradient_clip_value': 0.5,      # Maximum gradient norm
-        'gradient_clip_algorithm': 'norm',  # Use norm clipping
-        'monitor_gradients': True,         # Track gradient statistics
-        'clip_discriminator': True,        # Apply clipping to discriminator
-        'clip_generator': True,            # Apply clipping to generator
-        
+        'save_on_error': True,
+        'clear_cache_on_start': True,
+
+        # Image normalization
+        'normalize_samples': True,
+        # Updated normalization parameters
+        'normalization_mean': [0.5, 0.5, 0.5],
+        'normalization_std': [0.5, 0.5, 0.5],
+
         # Early stopping
-        'early_stopping_patience': 15,
-        'resume_training': True,
-        
-        # Memory cleanup
-        'empty_cache_frequency': 50,      # Check memory less frequently
-        'warmup_epochs': 3,
-        'warmup_lr_factor': 0.1,
-        'torch_hub_dir': 'pretrained_weights',  # Custom directory for downloaded weights
-        'clear_cache_on_start': True,          # Whether to clear existing cache
-        
-        # Added parameters for image quality
-        'normalize_samples': True,     # Whether to normalize images to [-1, 1]
-        'sample_value_range': (0, 1),  # Input image value range
-        # Memory management
-        'memory_threshold': 0.8,       # Trigger cleanup at 80% memory usage
-        'max_oom_retries': 3,         # Maximum OOM retries per batch
-        
+        'early_stopping_patience': 30,
+
+        # DataLoader settings
+        'prefetch_factor': 2,
+        'dataloader': {
+            'pin_memory': True,
+            'drop_last': True,
+            'persistent_workers': True
+        },
+
+        # Sample saving
+        'sample_frequency': 2,
+        'initial_sample_epochs': 5,
+        'final_sample_epochs': 5,
+        'keep_last_samples': 5,
+
+        # Validation metrics
         'validation': {
-            'fid_frequency': 10,      # How often to compute FID score
-            'metric_weights': {       # Weights for early stopping decision
-                'val_g_loss': 0.3,
-                'val_fid': 0.3,
+            'fid_frequency': 5,
+            'metric_weights': {
+                'val_g_loss': 0.2,
+                'val_fid': 0.4,
                 'val_lpips': 0.2,
                 'val_identity_sim': 0.2
             }
         },
-        # Pretrained weights configuration
-        'pretrained_weights_path': '',  # Custom path to pretrained weights
-        'download_weights': True,       # Whether to download weights automatically
-        'verify_weights': True,         # Whether to verify downloaded weights
-        'weights_download_retry': 3,    # Number of download attempts
-        
-        # Logging and monitoring
-        'log_frequency': None,  # Will be calculated automatically
-        'min_logging_interval': 30,  # Minimum seconds between logs
-        'detailed_logging': {
-            'system_metrics': True,     # Log system metrics (GPU memory, etc.)
-            'training_metrics': True,   # Log detailed training metrics
-            'batch_metrics': False      # Log per-batch metrics (can be verbose)
-        },
-        
-        # Progress display
-        'use_tqdm': True,              # Use progress bars
-        'log_to_file': True,           # Save logs to file
-        'log_level': 'INFO',           # Logging detail level
-        
-        # Face recognition parameters
-        'lambda_identity': 2.0,          # Weight for face identity loss
-        'lambda_face_alignment': 1.0,    # Weight for facial landmark alignment
-        'face_recognition': {
-            'min_detection_confidence': 0.9,
-            'use_landmarks': True,
-            'identity_threshold': 0.7,    # Minimum identity similarity threshold
-            'alignment_threshold': 0.1    # Maximum allowed landmark deviation
-        },
-        # Checkpoint management
-        'checkpoint_dir': 'checkpoints',
-        'keep_last_checkpoints': 3,
-        'save_best_model': True,
-        'checkpoint_frequency': 5,  # Save every N epochs
-        'save_on_error': True,     # Save checkpoint when error occurs
-        'compress_checkpoints': False,  # Option to compress checkpoints
-        'backup_checkpoints': False,    # Option to backup to external storage
-        # Sample management
-        'sample_frequency': 5,           # Save samples every N epochs
-        'initial_sample_epochs': 5,      # Always save samples for first N epochs
-        'final_sample_epochs': 3,        # Always save samples for last N epochs
-        'keep_last_samples': 10,         # Number of sample directories to keep
-        'max_samples_per_class': 8,      # Maximum number of samples to save
-        'sample_image_quality': 90,      # JPEG quality for saved samples
-        'sample_management': {
-            'compress_samples': True,    # Use JPEG compression
-            'max_disk_usage_gb': 10,     # Maximum disk space for samples
-            'cleanup_threshold': 0.9,    # Cleanup when disk usage exceeds 90%
-            'keep_first_epoch': True,    # Always keep first epoch samples
-            'keep_best_samples': True,   # Keep samples from best models
-        },
-        # Error handling
-        'error_handling': {
-            'save_on_error': True,          # Save checkpoint on error
-            'max_oom_retries': 3,           # Maximum OOM retry attempts
-            'log_critical_errors': True,     # Log critical errors
-            'error_log_path': 'logs/errors',  # Path for error logs
-            'recovery_batch_size': 1,        # Fallback batch size for OOM
-            'memory_monitoring': True        # Monitor memory usage
-        },
-        # Debug settings
-        'debug': {
-            'trace_memory': False,          # Enable memory tracing
-            'profile_execution': False,      # Enable profiling
-            'verbose_errors': True,         # Detailed error messages
-            'save_memory_stats': True       # Save memory statistics
-        },
-        # DataLoader optimization
-        'max_workers_per_gpu': 4,        # Maximum workers per GPU
-        'num_workers': None,             # Will be calculated automatically
-        'prefetch_factor': 4,            # Number of batches to prefetch
-        'dataloader': {
-            'persistent_workers': True,   # Keep workers alive between epochs
-            'pin_memory': True,          # Use pinned memory for faster transfer
-            'non_blocking': True,        # Enable non-blocking transfers
-            'timeout': 120,              # Increase timeout for large images
-            'drop_last': True,           # Skip incomplete batches
-            'worker_init_fn': None,      # Custom worker initialization
-        },
-        
-        # Memory management for data loading
-        'memory_pinning': {
-            'pin_memory': True,
-            'pin_memory_device': None,   # Set automatically based on GPU
-            'pin_memory_max_bytes': None # Automatic based on available memory
-        },
-        
-        # Performance monitoring
-        'monitor_loading': {
-            'track_loading_time': True,  # Monitor data loading time
-            'loading_stats_frequency': 50,  # How often to log loading stats
-            'warn_slow_loading': True,   # Warning for slow data loading
-        }
+
+        # Logging
+        'use_tqdm': True,
+        'log_frequency': 50,
+        'dataset_path': 'datasets/dataset',
+
+        # Gradient clipping
+        'gradient_clip_value': 1.0,
+        'gradient_clip_algorithm': 'norm',
+        'clip_discriminator': True,
+        'clip_generator': True,
+        'augment_synthetic_data': True,
+
+        # Additional configurations
+        'enable_gradient_checkpointing': False,  # Not needed with lower resolution
     }
 
     # Create necessary directories
@@ -1419,10 +995,9 @@ if __name__ == "__main__":
     # Check CUDA availability
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is not available")
-    
-    # Get number of available GPUs
-    world_size = torch.cuda.device_count()
-    
+
+    world_size = config['world_size']
+
     # Launch training processes
     try:
         mp.spawn(
@@ -1433,6 +1008,5 @@ if __name__ == "__main__":
         )
     except Exception as e:
         print(f"Training failed with error: {str(e)}")
-        # Cleanup in case of error
         if dist.is_initialized():
             cleanup()

@@ -1,7 +1,7 @@
 import os
 import random
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageEnhance
 import shutil
 from tqdm import tqdm
 
@@ -19,6 +19,7 @@ def create_directory_structure():
     for dir in dirs:
         path = os.path.join(dataset_folder, dir)
         os.makedirs(path, exist_ok=True)
+        # Remove existing files in the directory
         for file in os.listdir(path):
             os.remove(os.path.join(path, file))
 
@@ -36,13 +37,13 @@ def process_dataset():
     train_pairs = image_pairs[:split_idx]
     val_pairs = image_pairs[split_idx:]
     
-    # Process training set (minimal augmentation for synthetic data)
+    # Process training set with augmentations
     print("\nProcessing training set...")
     for original_idx, img_name in tqdm(train_pairs):
         before_path = os.path.join(before_folder, img_name)
         after_path = os.path.join(after_folder, img_name)
         
-        # Load images in high quality
+        # Load images
         img_before = Image.open(before_path).convert('RGB')
         img_after = Image.open(after_path).convert('RGB')
         
@@ -51,7 +52,7 @@ def process_dataset():
         img_before.save(
             os.path.join(dataset_folder, 'train_A', f'pair_{pair_id}.png'),
             format='PNG',
-            optimize=False  # Preserve exact pixel values
+            optimize=False
         )
         img_after.save(
             os.path.join(dataset_folder, 'train_B', f'pair_{pair_id}.png'),
@@ -59,22 +60,55 @@ def process_dataset():
             optimize=False
         )
         
-        # Only add horizontal flip for synthetic data
-        if random.random() < 0.5:
-            img_before_flip = img_before.transpose(Image.FLIP_LEFT_RIGHT)
-            img_after_flip = img_after.transpose(Image.FLIP_LEFT_RIGHT)
-            
-            img_before_flip.save(
-                os.path.join(dataset_folder, 'train_A', f'pair_{pair_id}_flip.png'),
-                format='PNG',
-                optimize=False
-            )
-            img_after_flip.save(
-                os.path.join(dataset_folder, 'train_B', f'pair_{pair_id}_flip.png'),
-                format='PNG',
-                optimize=False
-            )
-    
+        # Generate augmented pairs
+        # Augmentation 1: Horizontal Flip
+        img_before_aug1 = img_before.transpose(Image.FLIP_LEFT_RIGHT)
+        img_after_aug1 = img_after.transpose(Image.FLIP_LEFT_RIGHT)
+        img_before_aug1.save(
+            os.path.join(dataset_folder, 'train_A', f'pair_{pair_id}_aug1.png'),
+            format='PNG',
+            optimize=False
+        )
+        img_after_aug1.save(
+            os.path.join(dataset_folder, 'train_B', f'pair_{pair_id}_aug1.png'),
+            format='PNG',
+            optimize=False
+        )
+        
+        # Augmentation 2: Brightness Adjustment
+        brightness_factor = random.uniform(0.9, 1.1)
+        enhancer_before = ImageEnhance.Brightness(img_before)
+        img_before_aug2 = enhancer_before.enhance(brightness_factor)
+        enhancer_after = ImageEnhance.Brightness(img_after)
+        img_after_aug2 = enhancer_after.enhance(brightness_factor)
+        img_before_aug2.save(
+            os.path.join(dataset_folder, 'train_A', f'pair_{pair_id}_aug2.png'),
+            format='PNG',
+            optimize=False
+        )
+        img_after_aug2.save(
+            os.path.join(dataset_folder, 'train_B', f'pair_{pair_id}_aug2.png'),
+            format='PNG',
+            optimize=False
+        )
+        
+        # Augmentation 3: Contrast Adjustment
+        contrast_factor = random.uniform(0.9, 1.1)
+        enhancer_before = ImageEnhance.Contrast(img_before)
+        img_before_aug3 = enhancer_before.enhance(contrast_factor)
+        enhancer_after = ImageEnhance.Contrast(img_after)
+        img_after_aug3 = enhancer_after.enhance(contrast_factor)
+        img_before_aug3.save(
+            os.path.join(dataset_folder, 'train_A', f'pair_{pair_id}_aug3.png'),
+            format='PNG',
+            optimize=False
+        )
+        img_after_aug3.save(
+            os.path.join(dataset_folder, 'train_B', f'pair_{pair_id}_aug3.png'),
+            format='PNG',
+            optimize=False
+        )
+        
     # Process validation set (no augmentation)
     print("\nProcessing validation set...")
     for original_idx, img_name in tqdm(val_pairs):
@@ -89,4 +123,4 @@ if __name__ == "__main__":
     print("Creating directory structure...")
     create_directory_structure()
     print("Processing dataset...")
-    process_dataset() 
+    process_dataset()
